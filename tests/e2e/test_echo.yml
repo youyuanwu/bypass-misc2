@@ -1,5 +1,5 @@
 ---
-- name: Test VM connectivity with echo
+- name: Test VM connectivity and NVMe
   hosts: test_vm
   gather_facts: false
 
@@ -11,3 +11,23 @@
     - name: Display echo output
       ansible.builtin.debug:
         msg: "{{ echo_result.stdout }}"
+
+    - name: Check NVMe device exists
+      ansible.builtin.stat:
+        path: /dev/nvme0n1
+      register: nvme_device
+
+    - name: Verify NVMe device is present
+      ansible.builtin.assert:
+        that:
+          - nvme_device.stat.exists
+        fail_msg: "NVMe device /dev/nvme0n1 not found"
+        success_msg: "NVMe device /dev/nvme0n1 exists"
+
+    - name: Get NVMe device info
+      ansible.builtin.command: lsblk /dev/nvme0n1
+      register: nvme_info
+
+    - name: Display NVMe info
+      ansible.builtin.debug:
+        msg: "{{ nvme_info.stdout }}"

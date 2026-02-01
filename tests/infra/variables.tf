@@ -69,3 +69,15 @@ variable "use_kvm" {
   type        = bool
   default     = true
 }
+
+variable "nvme_enabled" {
+  description = "Add an emulated NVMe device to the VM"
+  type        = bool
+  default     = true
+}
+
+variable "nvme_disk_size" {
+  description = "NVMe disk size in bytes (default 1GB)"
+  type        = number
+  default     = 1073741824 # 1 GB
+}

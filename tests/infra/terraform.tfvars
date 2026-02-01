@@ -10,6 +10,10 @@ network_name   = "default"
 base_image_url = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 ssh_user       = "ubuntu"
 
+# NVMe emulation (creates /dev/nvme0n1 in VM)
+nvme_enabled   = true
+nvme_disk_size = 1073741824 # 1 GB
+
 # SSH key is loaded automatically from ~/.ssh/id_rsa.pub via variables.tf default
 # Uncomment below to override with a specific key:
 # ssh_public_key = "ssh-rsa AAAA... your-key-here"

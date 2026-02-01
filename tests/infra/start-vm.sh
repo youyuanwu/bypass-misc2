@@ -10,6 +10,7 @@ export LIBVIRT_DEFAULT_URI="qemu:///system"
 # Parse arguments
 USE_KVM=true
 AUTO_APPROVE=false
+NO_COLOR=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-kvm)
@@ -20,10 +21,15 @@ while [[ $# -gt 0 ]]; do
             AUTO_APPROVE=true
             shift
             ;;
+        --no-color)
+            NO_COLOR=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--no-kvm] [-y]"
-            echo "  --no-kvm  Use QEMU software emulation instead of KVM (slower)"
-            echo "  -y, --yes Auto-approve without prompting"
+            echo "Usage: $0 [--no-kvm] [-y] [--no-color]"
+            echo "  --no-kvm    Use QEMU software emulation instead of KVM (slower)"
+            echo "  -y, --yes   Auto-approve without prompting"
+            echo "  --no-color  Disable colored output"
             exit 0
             ;;
         *)
@@ -32,6 +38,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Set terraform color flag
+TF_COLOR_ARG=""
+if [[ "$NO_COLOR" == "true" ]]; then
+    TF_COLOR_ARG="-no-color"
+    export ANSIBLE_NOCOLOR=1
+    export NO_COLOR=1
+fi
 
 if [[ "$USE_KVM" == "true" ]]; then
     echo "=== QEMU/KVM VM Provisioning ==="
@@ -86,12 +100,12 @@ fi
 # Initialize Terraform if needed
 if [[ ! -d ".terraform" ]]; then
     echo "Initializing Terraform..."
-    terraform init
+    terraform init $TF_COLOR_ARG
 fi
 
 # Plan and apply
 echo "Planning infrastructure..."
-terraform plan $TF_VAR_ARGS -out=tfplan
+terraform plan $TF_COLOR_ARG $TF_VAR_ARGS -out=tfplan
 
 echo ""
 if [[ "$AUTO_APPROVE" == "true" ]]; then
@@ -103,7 +117,7 @@ fi
 
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Applying configuration..."
-    terraform apply $TF_VAR_ARGS tfplan
+    terraform apply $TF_COLOR_ARG $TF_VAR_ARGS tfplan
     rm -f tfplan
 
     echo ""
@@ -129,7 +143,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     done
 
     echo ""
-    terraform output
+    terraform output $TF_COLOR_ARG
     echo ""
     echo "Connect with:"
     VM_IP=$(virsh net-dhcp-leases default 2>/dev/null | grep "$VM_NAME" | awk '{print $5}' | cut -d'/' -f1)

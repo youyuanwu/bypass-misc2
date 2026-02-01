@@ -6,6 +6,10 @@ terraform {
       source  = "dmacvicar/libvirt"
       version = "~> 0.9"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = "~> 3.0"
+    }
   }
 }
 
@@ -94,6 +98,55 @@ resource "libvirt_volume" "cloudinit" {
     content = {
       url = libvirt_cloudinit_disk.cloudinit.path
     }
+  }
+
+  lifecycle {
+    replace_triggered_by = [libvirt_cloudinit_disk.cloudinit]
+  }
+}
+
+# NVMe disk - created in /tmp for easy permissions (world-writable)
+# QEMU can access /tmp without needing special directory permissions
+locals {
+  nvme_disk_path = var.nvme_enabled ? "/tmp/${var.vm_name}-nvme.qcow2" : ""
+}
+
+resource "null_resource" "nvme_disk" {
+  count = var.nvme_enabled ? 1 : 0
+
+  triggers = {
+    disk_path = local.nvme_disk_path
+    disk_size = var.nvme_disk_size
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command = <<-EOT
+      set -e
+      DISK_PATH="${local.nvme_disk_path}"
+      DISK_SIZE_BYTES=${var.nvme_disk_size}
+      
+      # Ensure build directory exists
+      mkdir -p "$(dirname "$DISK_PATH")"
+      
+      # Convert bytes to MB for qemu-img
+      DISK_SIZE_MB=$((DISK_SIZE_BYTES / 1024 / 1024))
+      
+      if [[ ! -f "$DISK_PATH" ]]; then
+        echo "Creating NVMe disk: $DISK_PATH ($DISK_SIZE_MB MB)"
+        qemu-img create -f qcow2 "$DISK_PATH" "$${DISK_SIZE_MB}M"
+      else
+        echo "NVMe disk already exists: $DISK_PATH"
+      fi
+      
+      # Make readable by QEMU (runs as libvirt-qemu user)
+      chmod 666 "$DISK_PATH"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "rm -f ${self.triggers.disk_path} 2>/dev/null || true"
   }
 }
 
@@ -193,4 +246,81 @@ resource "libvirt_domain" "vm" {
       }
     ]
   }
+}
+
+# Add NVMe device by patching domain XML (libvirt provider doesn't support NVMe natively)
+# Uses QEMU command line passthrough to add NVMe controller and namespace
+resource "null_resource" "add_nvme" {
+  count = var.nvme_enabled ? 1 : 0
+
+  triggers = {
+    domain_id = libvirt_domain.vm.id
+    nvme_path = local.nvme_disk_path
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      
+      echo "Adding NVMe disk to VM ${var.vm_name}..."
+      
+      # Wait for VM to be defined
+      for i in {1..30}; do
+        if virsh dominfo ${var.vm_name} >/dev/null 2>&1; then
+          break
+        fi
+        echo "Waiting for VM to be defined... ($i/30)"
+        sleep 1
+      done
+      
+      # Stop the VM if running
+      if virsh list --name | grep -q "^${var.vm_name}$"; then
+        echo "Stopping VM..."
+        virsh destroy ${var.vm_name}
+        sleep 2
+      fi
+      
+      # Get current XML
+      echo "Dumping VM XML..."
+      virsh dumpxml ${var.vm_name} > /tmp/${var.vm_name}.xml
+      
+      # Check if NVMe already added (look for qemu:commandline with nvme)
+      if grep -q 'drive id=nvme0' /tmp/${var.vm_name}.xml; then
+        echo "NVMe disk already configured"
+      else
+        echo "Adding QEMU NVMe command line arguments..."
+        
+        # Add xmlns:qemu if not present
+        if ! grep -q 'xmlns:qemu=' /tmp/${var.vm_name}.xml; then
+          sed -i 's|<domain |<domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" |' /tmp/${var.vm_name}.xml
+        fi
+        
+        # Add qemu:commandline section before </domain>
+        # Use bus=pci.0,addr=0x10 to avoid conflict with video card on addr=0x2
+        sed -i '/<\/domain>/i \
+  <qemu:commandline>\
+    <qemu:arg value="-drive"/>\
+    <qemu:arg value="file=${local.nvme_disk_path},format=qcow2,if=none,id=nvme0"/>\
+    <qemu:arg value="-device"/>\
+    <qemu:arg value="nvme,serial=deadbeef,drive=nvme0,bus=pci.0,addr=0x10"/>\
+  </qemu:commandline>' /tmp/${var.vm_name}.xml
+        
+        # Redefine domain
+        echo "Redefining VM with NVMe..."
+        virsh define /tmp/${var.vm_name}.xml
+      fi
+      
+      # Start VM
+      echo "Starting VM..."
+      virsh start ${var.vm_name}
+      
+      rm -f /tmp/${var.vm_name}.xml
+      echo "NVMe disk added successfully"
+    EOT
+    environment = {
+      LIBVIRT_DEFAULT_URI = var.libvirt_uri
+    }
+  }
+
+  depends_on = [libvirt_domain.vm, null_resource.nvme_disk]
 }

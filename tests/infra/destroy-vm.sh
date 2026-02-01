@@ -10,6 +10,7 @@ export LIBVIRT_DEFAULT_URI="qemu:///system"
 # Parse arguments
 USE_KVM=true
 AUTO_APPROVE=false
+NO_COLOR=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --no-kvm)
@@ -20,10 +21,15 @@ while [[ $# -gt 0 ]]; do
             AUTO_APPROVE=true
             shift
             ;;
+        --no-color)
+            NO_COLOR=true
+            shift
+            ;;
         -h|--help)
-            echo "Usage: $0 [--no-kvm] [-y]"
-            echo "  --no-kvm  Use QEMU software emulation config (must match how VM was created)"
-            echo "  -y, --yes Auto-approve without prompting"
+            echo "Usage: $0 [--no-kvm] [-y] [--no-color]"
+            echo "  --no-kvm    Use QEMU software emulation config (must match how VM was created)"
+            echo "  -y, --yes   Auto-approve without prompting"
+            echo "  --no-color  Disable colored output"
             exit 0
             ;;
         *)
@@ -32,6 +38,12 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Set terraform color flag
+TF_COLOR_ARG=""
+if [[ "$NO_COLOR" == "true" ]]; then
+    TF_COLOR_ARG="-no-color"
+fi
 
 TF_VAR_ARGS=""
 if [[ "$USE_KVM" == "false" ]]; then
@@ -61,7 +73,7 @@ fi
 
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Destroying VM..."
-    terraform destroy $TF_VAR_ARGS -auto-approve
+    terraform destroy $TF_COLOR_ARG $TF_VAR_ARGS -auto-approve
 
     echo ""
     echo "=== VM Destroyed Successfully ==="
