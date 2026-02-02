@@ -170,7 +170,8 @@ resource "libvirt_domain" "vm" {
 
   cpu = {
     mode = var.use_kvm ? "host-passthrough" : "custom"
-    model = var.use_kvm ? null : "qemu64"
+    # Use Nehalem for TCG emulation - provides SSE4.2 needed by SPDK/DPDK built with --target-arch=nehalem
+    model = var.use_kvm ? null : "Nehalem"
   }
 
   devices = {

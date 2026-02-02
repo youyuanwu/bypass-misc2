@@ -34,13 +34,6 @@ jobs:
     - name: Configure cmake
       run: cmake -S . -B build
 
-    - name: Patch SPDK for pip-tools compatibility
-      run: |
-        # Create missing version.py for SPDK Python package (needed by hatchling/pip-compile)
-        echo "__version__ = '26.1.0'" > build/spdk-src/python/spdk/version.py
-        # Patch pkgdep script to use pinned pip-tools (pip-tools 7.5.2 is incompatible with pip 26)
-        sed -i 's/python -m pip install pip-tools/python -m pip install "pip<25" "pip-tools==7.4.1"/' build/spdk-src/scripts/pkgdep/debian.sh
-
     - name: SPDK dependencies
       run: |
         sudo cmake --build build --target spdk_pkgdep
@@ -49,3 +42,131 @@ jobs:
       run: |
         cmake --build build --target configure_spdk
         cmake --build build --target build_spdk --parallel --verbose
+
+    - name: Debug - Check spdk_lspci dependencies
+      run: |
+        echo "=== ldd spdk_lspci ==="
+        ldd build/spdk-src/build/bin/spdk_lspci || true
+        echo "=== Check for isal ==="
+        ldd build/spdk-src/build/bin/spdk_lspci 2>&1 | grep -i isal || echo "No isal dependency found"
+
+    - name: Build SPDK deb package
+      run: |
+        cmake --build build --target spdk_deb
+
+    - name: Upload SPDK deb artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: spdk-deb
+        path: build/spdk_26.01_amd64.deb
+        if-no-files-found: error
+        retention-days: 2
+
+  e2e-test:
+    name: Run E2E Tests
+    runs-on: ubuntu-latest
+    # Start immediately, don't wait for build - we'll wait for artifact later
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Start VM setup immediately (runs in parallel with build job)
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst cloud-image-utils
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.4"
+
+      - name: Start and configure libvirt
+        run: |
+          sudo systemctl start libvirtd
+          sudo usermod -aG libvirt $USER
+          # Allow current session to use libvirt
+          sudo chmod 666 /var/run/libvirt/libvirt-sock
+          
+          # Configure QEMU to run without security restrictions (for CI only)
+          echo 'security_driver = "none"' | sudo tee -a /etc/libvirt/qemu.conf
+          echo 'user = "root"' | sudo tee -a /etc/libvirt/qemu.conf
+          echo 'group = "root"' | sudo tee -a /etc/libvirt/qemu.conf
+          sudo systemctl restart libvirtd
+          
+          # Create default storage pool
+          sudo mkdir -p /var/lib/libvirt/images
+          sudo chmod 777 /var/lib/libvirt/images
+          sudo virsh pool-define-as default dir --target /var/lib/libvirt/images
+          sudo virsh pool-build default
+          sudo virsh pool-start default
+          sudo virsh pool-autostart default
+          
+          # Start default network
+          sudo virsh net-start default || true
+
+      - name: Generate SSH key
+        run: |
+          ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N ""
+
+      - name: Provision test VM (software emulation)
+        working-directory: tests/infra
+        run: ./start-vm.sh --no-kvm -y
+
+      - name: Wait for VM to boot
+        env:
+          LIBVIRT_DEFAULT_URI: qemu:///system
+        run: |
+          echo "Waiting for VM to get DHCP lease (this may take a while without KVM)..."
+          for i in {1..60}; do
+            if virsh net-dhcp-leases default | grep -q "test-vm"; then
+              echo "VM has DHCP lease"
+              break
+            fi
+            echo "Attempt $i/60: Waiting..."
+            sleep 10
+          done
+          # Additional wait for SSH to be ready
+          sleep 30
+
+      # Now wait for build job's artifact (VM setup happened in parallel with build)
+      - name: Wait for build job to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for build job to complete..."
+          for i in {1..60}; do
+            # Check if artifact exists
+            if gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts --jq '.artifacts[].name' 2>/dev/null | grep -q "spdk-deb"; then
+              echo "Artifact is ready!"
+              exit 0
+            fi
+            
+            # Check if build job failed
+            BUILD_STATUS=$(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs --jq '.jobs[] | select(.name == "build (ubuntu-latest)") | .conclusion' 2>/dev/null)
+            if [ "$BUILD_STATUS" = "failure" ] || [ "$BUILD_STATUS" = "cancelled" ]; then
+              echo "Build job failed or was cancelled!"
+              exit 1
+            fi
+            
+            echo "Attempt $i/60: Waiting for build to complete..."
+            sleep 30
+          done
+          echo "Timeout waiting for artifact"
+          exit 1
+
+      - name: Download SPDK deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spdk-deb
+          path: build
+
+      - name: Run E2E tests
+        working-directory: tests/e2e
+        run: ./run-test.sh
+
+      - name: Destroy test VM
+        if: always()
+        working-directory: tests/infra
+        run: ./destroy-vm.sh --no-kvm -y

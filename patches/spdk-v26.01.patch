@@ -1,0 +1,33 @@
+--- a/scripts/pkgdep/debian.sh
++++ b/scripts/pkgdep/debian.sh
+@@ -21,7 +21,8 @@ if [[ ! -f "$virtdir/bin/activate" ]]; then
+ fi
+ pkgdep_toolpath pip "$virtdir/bin"
+ source "$virtdir/bin/activate"
+-python -m pip install pip-tools
++# Pin pip-tools to 7.4.1 - pip-tools 7.5.2+ is incompatible with pip 26 (allow_all_prereleases removed)
++python -m pip install "pip<25" "pip-tools==7.4.1"
+ pip-compile --extra dev --strip-extras -o "$rootdir/scripts/pkgdep/requirements.txt" "${rootdir}/python/pyproject.toml"
+ pip3 install -r "$rootdir/scripts/pkgdep/requirements.txt"
+ 
+--- a/lib/env_dpdk/init.c
++++ b/lib/env_dpdk/init.c
+@@ -541,9 +541,10 @@ build_eal_cmdline(const struct spdk_env_opts *opts)
+ 		/* DPDK by default guesses that it should be using iova-mode=va so that it can
+ 		 * support running as an unprivileged user. However, some systems (especially
+ 		 * virtual machines) don't have an IOMMU capable of handling the full virtual
+-		 * address space and DPDK doesn't currently catch that. Add a check in SPDK
+-		 * and force iova-mode=pa here. */
+-		if (!no_huge && !x86_cpu_support_iommu()) {
++		 * address space and DPDK doesn't currently catch that. Use 'else if' to avoid
++		 * adding --iova-mode=pa twice when both noiommu and no-IOMMU conditions are true
++		 * (e.g., VMs using vfio-pci noiommu without hardware IOMMU). */
++		else if (!no_huge && !x86_cpu_support_iommu()) {
+ 			args = push_arg(args, &argcount, _sprintf_alloc("--iova-mode=pa"));
+ 			if (args == NULL) {
+ 				return -1;
+--- /dev/null
++++ b/python/spdk/version.py
+@@ -0,0 +1,2 @@
++# Auto-generated for hatchling/pip-compile compatibility
++__version__ = '26.1.0'

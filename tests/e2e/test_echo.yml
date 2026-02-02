@@ -2,6 +2,9 @@
 - name: Test VM connectivity and NVMe
   hosts: test_vm
   gather_facts: false
+  vars:
+    spdk_deb_local: "{{ playbook_dir }}/../../build/spdk_26.01_amd64.deb"
+    spdk_deb_remote: "/tmp/spdk_26.01_amd64.deb"
 
   tasks:
     - name: Execute echo command
@@ -12,22 +15,183 @@
       ansible.builtin.debug:
         msg: "{{ echo_result.stdout }}"
 
-    - name: Check NVMe device exists
+    # SPDK deb installation with hash check
+    - name: Get local SPDK deb checksum
+      delegate_to: localhost
       ansible.builtin.stat:
-        path: /dev/nvme0n1
-      register: nvme_device
+        path: "{{ spdk_deb_local }}"
+        checksum_algorithm: sha256
+      register: local_deb_stat
 
-    - name: Verify NVMe device is present
+    - name: Check if SPDK deb exists on remote
+      ansible.builtin.stat:
+        path: "{{ spdk_deb_remote }}"
+        checksum_algorithm: sha256
+      register: remote_deb_stat
+
+    - name: Copy SPDK deb to VM
+      ansible.builtin.copy:
+        src: "{{ spdk_deb_local }}"
+        dest: "{{ spdk_deb_remote }}"
+        mode: '0644'
+      when: not remote_deb_stat.stat.exists or remote_deb_stat.stat.checksum != local_deb_stat.stat.checksum
+
+    - name: Install SPDK deb package
+      become: true
+      ansible.builtin.apt:
+        deb: "{{ spdk_deb_remote }}"
+        state: present
+      when: not remote_deb_stat.stat.exists or remote_deb_stat.stat.checksum != local_deb_stat.stat.checksum
+
+    # Check NVMe PCI device exists (before SPDK binding, /dev/nvme0n1 exists; after binding it disappears)
+    - name: Check NVMe PCI device exists
+      ansible.builtin.shell: lspci | grep -i "Non-Volatile memory\|NVM Express"
+      register: nvme_pci_check
+      changed_when: false
+
+    - name: Verify NVMe PCI device is present
       ansible.builtin.assert:
         that:
-          - nvme_device.stat.exists
-        fail_msg: "NVMe device /dev/nvme0n1 not found"
-        success_msg: "NVMe device /dev/nvme0n1 exists"
+          - nvme_pci_check.rc == 0
+        fail_msg: "NVMe PCI device not found"
+        success_msg: "NVMe PCI device found: {{ nvme_pci_check.stdout }}"
 
-    - name: Get NVMe device info
-      ansible.builtin.command: lsblk /dev/nvme0n1
-      register: nvme_info
+    # Verify SPDK installation
+    - name: Check SPDK spdk_tgt exists
+      ansible.builtin.stat:
+        path: /usr/local/bin/spdk_tgt
+      register: spdk_tgt
 
-    - name: Display NVMe info
+    - name: Check SPDK spdk_lspci exists
+      ansible.builtin.stat:
+        path: /usr/local/bin/spdk_lspci
+      register: spdk_lspci
+
+    - name: Verify SPDK binaries are installed
+      ansible.builtin.assert:
+        that:
+          - spdk_tgt.stat.exists
+          - spdk_lspci.stat.exists
+        fail_msg: "SPDK binaries not found - installation may have failed"
+        success_msg: "SPDK binaries installed successfully"
+
+    - name: List installed SPDK binaries
+      ansible.builtin.command: ls -la /usr/local/bin/
+      register: spdk_binaries
+
+    - name: Display SPDK binaries
       ansible.builtin.debug:
-        msg: "{{ nvme_info.stdout }}"
+        msg: "{{ spdk_binaries.stdout_lines }}"
+
+    # Setup hugepages for DPDK/SPDK
+    - name: Allocate hugepages
+      become: true
+      ansible.builtin.shell: |
+        echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+        cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+      register: hugepages_result
+
+    - name: Display hugepages status
+      ansible.builtin.debug:
+        msg: "Hugepages allocated: {{ hugepages_result.stdout }}"
+
+    # Unbind NVMe from kernel driver for SPDK using vfio-pci (idempotent)
+    # Bind NVMe to vfio-pci for SPDK (requires noiommu mode in VMs without hardware IOMMU)
+    - name: Load vfio modules
+      become: true
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - vfio
+        - vfio_pci
+
+    - name: Enable unsafe noiommu mode for vfio (required without hardware IOMMU)
+      become: true
+      ansible.builtin.shell: |
+        echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+      changed_when: false
+
+    - name: Get NVMe PCI address
+      ansible.builtin.shell: lspci -D | grep -i "Non-Volatile memory\|NVM Express" | awk '{print $1}'
+      register: nvme_pci_addr
+      changed_when: false
+
+    - name: Display detected NVMe PCI address
+      ansible.builtin.debug:
+        msg: "NVMe PCI address: {{ nvme_pci_addr.stdout }}"
+
+    - name: Check if NVMe is bound to vfio-pci
+      become: true
+      ansible.builtin.stat:
+        path: "/sys/bus/pci/drivers/vfio-pci/{{ nvme_pci_addr.stdout }}"
+      register: nvme_vfio_bound
+      when: nvme_pci_addr.stdout != ""
+
+    - name: Unbind NVMe from kernel driver
+      become: true
+      ansible.builtin.shell: |
+        NVME_ADDR="{{ nvme_pci_addr.stdout }}"
+        # Only unbind if currently bound to nvme driver
+        if [ -L "/sys/bus/pci/devices/$NVME_ADDR/driver" ]; then
+          CURRENT_DRIVER=$(basename $(readlink /sys/bus/pci/devices/$NVME_ADDR/driver))
+          if [ "$CURRENT_DRIVER" = "nvme" ]; then
+            echo "$NVME_ADDR" > /sys/bus/pci/devices/$NVME_ADDR/driver/unbind
+            echo "Unbound from nvme driver"
+          fi
+        fi
+      when: 
+        - nvme_pci_addr.stdout != ""
+        - not nvme_vfio_bound.stat.exists
+      register: nvme_unbind_result
+      changed_when: "'Unbound' in nvme_unbind_result.stdout"
+
+    - name: Bind NVMe to vfio-pci
+      become: true
+      ansible.builtin.shell: |
+        NVME_ADDR="{{ nvme_pci_addr.stdout }}"
+        echo "vfio-pci" > /sys/bus/pci/devices/$NVME_ADDR/driver_override
+        echo "$NVME_ADDR" > /sys/bus/pci/drivers/vfio-pci/bind
+        echo "Bound $NVME_ADDR to vfio-pci"
+      when: 
+        - nvme_pci_addr.stdout != ""
+        - not nvme_vfio_bound.stat.exists
+      register: nvme_bind_result
+
+    - name: Verify NVMe bound to vfio-pci
+      become: true
+      ansible.builtin.stat:
+        path: "/sys/bus/pci/drivers/vfio-pci/{{ nvme_pci_addr.stdout }}"
+      register: nvme_vfio_verify
+      failed_when: not nvme_vfio_verify.stat.exists
+      when: nvme_pci_addr.stdout != ""
+
+    # Run spdk_lspci to verify SPDK works (lists PCI devices)
+    - name: Run spdk_lspci to verify SPDK
+      become: true
+      ansible.builtin.shell: |
+        export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+        /usr/local/bin/spdk_lspci 2>&1
+      register: spdk_lspci_result
+
+    - name: Display spdk_lspci output
+      ansible.builtin.debug:
+        msg: "{{ spdk_lspci_result.stdout_lines }}"
+
+    - name: Verify spdk_lspci ran successfully
+      ansible.builtin.assert:
+        that:
+          - spdk_lspci_result.rc == 0
+        fail_msg: "spdk_lspci failed: {{ spdk_lspci_result.stderr }}"
+        success_msg: "SPDK verified - spdk_lspci ran successfully"
+
+    - name: Count actual PCI devices from spdk_lspci
+      ansible.builtin.set_fact:
+        spdk_device_lines: "{{ spdk_lspci_result.stdout_lines | select('match', '^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\\.[0-9a-fA-F]') | list }}"
+
+    - name: Verify at least one device detected by SPDK
+      ansible.builtin.assert:
+        that:
+          - spdk_device_lines | length > 0
+        fail_msg: "No PCI devices detected by spdk_lspci"
+        success_msg: "SPDK detected {{ spdk_device_lines | length }} device(s): {{ spdk_device_lines }}"
