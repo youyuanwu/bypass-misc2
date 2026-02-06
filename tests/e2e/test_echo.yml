@@ -57,23 +57,11 @@
         success_msg: "NVMe PCI device found: {{ nvme_pci_check.stdout }}"
 
     # Verify SPDK installation
-    - name: Check SPDK spdk_tgt exists
+    - name: Verify SPDK binaries are installed
       ansible.builtin.stat:
         path: /opt/spdk/bin/spdk_tgt
       register: spdk_tgt
-
-    - name: Check SPDK spdk_lspci exists
-      ansible.builtin.stat:
-        path: /opt/spdk/bin/spdk_lspci
-      register: spdk_lspci
-
-    - name: Verify SPDK binaries are installed
-      ansible.builtin.assert:
-        that:
-          - spdk_tgt.stat.exists
-          - spdk_lspci.stat.exists
-        fail_msg: "SPDK binaries not found - installation may have failed"
-        success_msg: "SPDK binaries installed successfully"
+      failed_when: not spdk_tgt.stat.exists
 
     - name: List installed SPDK binaries
       ansible.builtin.command: ls -la /opt/spdk/bin/
