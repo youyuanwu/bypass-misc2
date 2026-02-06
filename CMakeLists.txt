@@ -9,29 +9,18 @@ include(FetchContent)
 # SPDK v26.01 uses DPDK 25.11.0 (spdk-25.11 fork branch)
 # DPDK commit: e01bfcd05fe39f628392c8b29b880f5692de2224
 message(STATUS "Fetching SPDK source code...")
-FetchContent_Populate(
+FetchContent_Declare(
   spdk
   GIT_REPOSITORY https://github.com/spdk/spdk.git
   GIT_TAG        2ef883ef96e79c3cc16da02f667a7a58c2453f2f # v26.01
   GIT_SHALLOW    TRUE
-  GIT_SUBMODULES ""  # Don't auto-init submodules, we'll do it manually
+  GIT_SUBMODULES libvfio-user dpdk isa-l isa-l-crypto
+  GIT_PROGRESS TRUE
 )
+FetchContent_MakeAvailable(spdk)
 
 message(STATUS "SPDK source code fetched to: ${spdk_SOURCE_DIR}")
 message(STATUS "SPDK build directory: ${spdk_BINARY_DIR}")
-
-# Initialize only required submodules (skip dpdk - using system DPDK)
-# Skip: dpdk (system), intel-ipsec-mb (crypto disabled), isa-l-crypto (crypto disabled), ocf (disabled), xnvme (not needed)
-message(STATUS "Updating SPDK submodules (only isa-l and libvfio-user)...")
-execute_process(
-  COMMAND git submodule update --init --depth 1 -- isa-l libvfio-user
-  WORKING_DIRECTORY ${spdk_SOURCE_DIR}
-  RESULT_VARIABLE GIT_SUBMODULE_RESULT
-)
-
-if(NOT GIT_SUBMODULE_RESULT EQUAL "0")
-  message(FATAL_ERROR "git submodule update failed: ${GIT_SUBMODULE_RESULT}")
-endif()
 
 # Apply SPDK patches (idempotent - checks if already applied)
 set(SPDK_PATCH_FILE ${CMAKE_CURRENT_SOURCE_DIR}/patches/spdk-v26.01.patch)
@@ -100,8 +89,12 @@ endif()
 # Use system DPDK 25.11.0 (detected via pkg-config)
 # Use --target-arch=nehalem for broad compatibility (SSE4.2). QEMU TCG can emulate this.
 # ISA-L is only used by crypto module (disabled via --without-crypto), so no libisal dependency
+# Note: SPDK does not support true out-of-tree builds - must build in source directory
 add_custom_target(configure_spdk
-    COMMAND ${CMAKE_COMMAND} -E env ${SPDK_CC_ENV} ./configure --with-shared --without-rdma --without-fio --without-rbd --without-dpdk --without-ocf --without-crypto --disable-tests --disable-unit-tests --target-arch=nehalem
+    COMMAND ${CMAKE_COMMAND} -E env ${SPDK_CC_ENV} ./configure 
+      --with-shared --without-rdma --without-fio --without-rbd 
+      --without-dpdk --without-ocf --without-crypto 
+      --disable-tests --disable-unit-tests --target-arch=nehalem
     WORKING_DIRECTORY ${spdk_SOURCE_DIR}
     COMMENT "Configuring SPDK"
 )
