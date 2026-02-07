@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+  "spdk-io"
+, "spdk-io-sys", "spdk-io-test"]
+package.edition = "2024"
+package.authors = [ "youyuanwu@outlook.com" ]
+package.documentation = "https://github.com/youyuanwu/rust-spdk-io"
+package.repository = "https://github.com/youyuanwu/rust-spdk-io"
+package.license = "MIT"
+
+[workspace.dependencies]
+
+# crate in this workspace
+# spdk-io = { path = "spdk-io", version = "0.1.0" }
+# spdk-sys = { path = "spdk-sys", version = "0.1.0" }
+# spdk-io-test = { path = "spdk-io-test" }

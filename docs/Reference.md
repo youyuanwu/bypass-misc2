@@ -1,0 +1,50 @@
+# SPDK
+
+## Reference projects
+
+- [spdk-rs](https://github.com/openebs/spdk-rs)
+  - **Summary**: Higher-level Rust bindings and wrappers around SPDK for building safer SPDK-based Rust applications. Most actively maintained project (85 stars, 16 contributors). Uses Nix package manager for reproducible development environment. Developed by OpenEBS for Mayastor storage products. Supports SPDK v24.01+ with static library linking. Provides helper scripts for SPDK configuration/compilation.
+  - **FFI Bindings**: Uses bindgen at build time with `wrapper.h` including many SPDK headers. Generated code stored in `src/libspdk/mod.rs` (includes from `OUT_DIR`). Extensive `build.rs` with library discovery via pkg-config, allowlist/blocklist for types/functions. Also compiles C helpers in `helpers/` directory.
+  - **Rust API Layout**:
+    - Generic wrapper types with `BdevData` type parameter: `Bdev<BdevData>`, `BdevDesc<BdevData>`, `BdevIo<BdevData>`, `IoChannel<ChannelData>`
+    - Uses `NonNull<T>` for safe pointer wrappers, lifetimes for module references
+    - Builder pattern: `BdevBuilder`, `BdevModuleBuilder`, `PollerBuilder`
+    - Modules: `bdev`, `bdev_module`, `io_channel`, `thread`, `poller`, `dma`, `nvme`, `nvmf`
+    - Helper utilities in `ffihelper.rs`: `cb_arg()`, `done_cb()`, `ErrnoResult`, string conversions
+    - Async support via `futures::channel::oneshot` for callback-to-async conversion
+
+- [starfish](https://github.com/jkozlowski/starfish) Rust futures on spdk
+  - **Summary**: Async programming framework with SPDK for Rust (Linux only). Provides a futures executor (`starfish-executor`) that integrates with SPDK's event loop. Includes `spdk-sys` for low-level bindings. Last updated 7 years ago (2018), built for SPDK v18.07.1. 33 stars.
+  - **FFI Bindings**: Separate `spdk-sys` crate. Uses bindgen to generate from SPDK headers (nvme, event, bdev, env, blob, blob_bdev, io_channel). Expects SPDK installed at `/usr/local/lib`. Links against `libspdk.so` shared library.
+  - **Rust API Layout**:
+    - Custom single-threaded executor in `starfish-executor`: `CurrentThreadExecutor`, `TaskQueue`, `TaskHandle`
+    - Custom waker implementation: `RcWake` trait, `waker_vtable!` macro
+    - Blob API: `Blobstore`, `Blob`, `BlobId`, `IoChannel`, `Buf` (DMA buffer)
+    - Async functions using `oneshot::channel` callback pattern: `bs_init()`, `create()`, `open()`, `read()`, `write()`, `close()`
+    - Event loop integration via `poller_register()` and `pure_poll()` entry point
+    - `AppOpts` for SPDK application initialization
+
+- [async-spdk](https://github.com/madsys-dev/async-spdk)
+  - **Summary**: Asynchronous Rust bindings for SPDK from MadSys research group. Provides Blob and BlobFs APIs with async/await support. Includes hello_blob and hello_bdev examples. Requires root privileges. Last updated 4 years ago. 17 stars, 2 contributors.
+  - **FFI Bindings**: Separate `spdk-sys` crate. Builds SPDK from source as git submodule, creates fat shared library `libspdk_fat.so` by linking all static libs together. Uses bindgen with `wrapper.h` (bdev, blob, blob_bdev, env, event, blobfs, vmd, log).
+  - **Rust API Layout**:
+    - Both sync and async APIs with `impl SpdkFile` split into `/// Sync API` and `/// Async API` blocks
+    - Main entry: `AppOpts` with `block_on<F: Future>()` method for running async code
+    - `spawn()` function + `JoinHandle<F>` for spawning futures, uses `spdk_poller_register`
+    - `LocalComplete<T>` type + `do_async()` helper for callback-to-async conversion
+    - Blob API: `Blobstore`, `Blob`, `BlobId`, `IoChannel`
+    - BlobFs API: `SpdkFilesystem`, `SpdkFile`, `SpdkFsThreadCtx`, `SpdkBlobfsOpts`
+    - Bdev API: `BDev`, `BdevDesc`, `BdevIo`, `DmaBuf`
+    - Thread/Poller management: `Thread`, `Poller`, `CpuSet`
+
+- [rust-spdk](https://github.com/PumpkinDB/rust-spdk)
+  - **Summary**: Early/basic Rust bindings for SPDK from the PumpkinDB project. Focused on NVMe controller access from Rust. Last updated 9 years ago (2017), likely abandoned. 19 stars. Minimal wrapper approach.
+  - **FFI Bindings**: Manual bindgen command documented in `HACKING.md`. Pre-generated bindings stored in `src/clib.rs`. Builds SPDK/DPDK from source in `build.rs`. Links against static libraries.
+  - **Rust API Layout**:
+    - NVMe-focused only, no Blob/Bdev abstractions
+    - Thin newtype wrappers: `Controller(*mut spdk_nvme_ctrlr)`, `Namespace(*mut spdk_nvme_ns)`, `QueuePair(*mut spdk_nvme_qpair)`
+    - Transport: `TransportIdentifier`, `OwnedTransportIdentifier` with parsing
+    - Callback traits: `CommandCallback` (for I/O completion), `ProbeCallback` (for controller discovery)
+    - `DMA<'a>` struct for DMA buffer management with lifetime
+    - `EnvOpts` + `init_env()` for environment initialization
+    - Macros: `ns_data!`, `ctrlr_data!` for accessing struct fields

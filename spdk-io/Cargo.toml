@@ -1,0 +1,12 @@
+[package]
+name = "spdk-io"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+documentation.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+spdk-io-sys = { path = "../spdk-io-sys" }
+thiserror = "1"

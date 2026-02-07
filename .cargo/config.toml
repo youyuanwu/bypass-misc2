@@ -1,0 +1,1 @@
+# Static linking handles all dependencies - no extra rustflags needed

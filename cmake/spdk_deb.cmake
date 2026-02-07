@@ -36,8 +36,9 @@ add_custom_target(spdk_deb
     COMMAND ${CMAKE_COMMAND} -E make_directory ${SPDK_PKG_DIR}/opt/spdk
     COMMAND cp -a ${SPDK_PKG_DIR}${spdk_SOURCE_DIR}/dpdk/build/. ${SPDK_PKG_DIR}/opt/spdk/
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${SPDK_PKG_DIR}/home
-    # Install bundled ISA-L library if it was built (depends on nasm being present during configure)
-    COMMAND ${CMAKE_COMMAND} -DSRC=${spdk_SOURCE_DIR}/isa-l/.libs/libisal.so.2 -DDST=${SPDK_PKG_DIR}/opt/spdk/lib -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake
+    # Install bundled ISA-L libraries if built (uses autotools install which includes .pc files)
+    COMMAND test -f ${spdk_SOURCE_DIR}/isa-l/Makefile && $(MAKE) -C ${spdk_SOURCE_DIR}/isa-l DESTDIR=${SPDK_PKG_DIR} install
+    COMMAND test -f ${spdk_SOURCE_DIR}/isa-l-crypto/Makefile && $(MAKE) -C ${spdk_SOURCE_DIR}/isa-l-crypto DESTDIR=${SPDK_PKG_DIR} install
     # Copy control file (generated), ldconfig conf, profile.d script, and maintainer scripts
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/spdk-control.txt ${SPDK_PKG_DIR}/DEBIAN/control
     COMMAND ${CMAKE_COMMAND} -E copy ${SPDK_PKG_TEMPLATES_DIR}/spdk.conf ${SPDK_PKG_DIR}/etc/ld.so.conf.d/spdk.conf
