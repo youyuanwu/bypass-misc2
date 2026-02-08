@@ -14,9 +14,20 @@
 | - pkg-config integration | ✅ | Static linking with `--whole-archive` |
 | - bindgen generation | ✅ | Rust 2024 compatible, `wrap_unsafe_ops(true)` |
 | - System deps handling | ✅ | Filters archive names, probes OpenSSL/ISA-L/uuid |
+| **spdk-io-build crate** | ✅ | Build helper for pkg-config parsing |
+| - `PkgConfigParser` | ✅ | Parses pkg-config with whole-archive region tracking |
+| - Static detection | ✅ | Auto-detects `.a` availability, excludes system roots |
+| - `force_whole_archive` | ✅ | Force whole-archive for specific libs (subsystem constructors) |
 | **spdk-io crate** | 🟡 | Core types implemented |
 | - `SpdkEnv` | ✅ | Environment guard with RAII cleanup |
 | - `SpdkEnvBuilder` | ✅ | Full configuration: name, core_mask, mem_size, shm_id, no_pci, no_huge, main_core |
+| - `SpdkApp` | ✅ | Full application framework via `spdk_app_start()` |
+| - `SpdkAppBuilder` | ✅ | Builder for app: name, config_file, reactor_mask, rpc_addr, mem_size_mb, no_pci, no_huge |
+| - `Bdev` | ✅ | Block device handle with lookup by name |
+| - `BdevDesc` | ✅ | Open bdev descriptor for I/O operations |
+| - `SpdkThread` | ✅ | Thread context with polling, `!Send + !Sync` |
+| - `CurrentThread` | ✅ | Borrowed reference to attached thread |
+| - `IoChannel` | ✅ | Per-thread I/O channel wrapper, `!Send + !Sync` |
 | - `Error` types | ✅ | Comprehensive error enum with thiserror |
 | - Integration tests | ✅ | vdev mode (no hugepages required) |
 | **CI/CD** | ✅ | GitHub Actions with SPDK deb package |
@@ -25,19 +36,18 @@
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| `SpdkThread` | ⏳ | Thread context management |
-| `IoChannel` | ⏳ | Thread-local I/O channels |
 | SPDK poller task | ⏳ | Async executor integration |
 
 ### Planned
 
 | Component | Notes |
 |-----------|-------|
-| `Bdev` / `BdevDesc` | Block device API with async read/write |
 | `DmaBuf` | DMA-capable buffer allocation |
+| Async read/write on `BdevDesc` | `read()`, `write()` with callback-to-future |
 | `Blobstore` / `Blob` | Blobstore API |
 | `NvmeController` | Direct NVMe access |
 | Callback-to-future utilities | `oneshot` channel pattern |
+| `SpdkThread::spawn()` | Spawn new OS thread + SPDK thread |
 
 ### Build & Linking
 
@@ -63,8 +73,11 @@ are included in the final binary.
 
 ```
 spdk-io/
+├── spdk-io-build/        # Build helper crate
+│   └── src/lib.rs        # PkgConfigParser with force_whole_archive
+│
 ├── spdk-io-sys/          # Low-level FFI bindings
-│   ├── build.rs          # Bindgen + linking
+│   ├── build.rs          # Bindgen + linking with force_whole_archive for subsystems
 │   ├── src/
 │   │   └── lib.rs        # Generated bindings + manual additions
 │   └── wrapper.h         # SPDK headers to bind
@@ -72,16 +85,23 @@ spdk-io/
 └── spdk-io/              # High-level async Rust API
     ├── src/
     │   ├── lib.rs
-    │   ├── env.rs        # Environment initialization
+    │   ├── app.rs        # SpdkApp/SpdkAppBuilder (spdk_app_start framework)
+    │   ├── env.rs        # SpdkEnv/SpdkEnvBuilder (low-level env init)
     │   ├── thread.rs     # SPDK thread management
-    │   ├── poller.rs     # SPDK poller (async task)
-    │   ├── bdev.rs       # Block device API
-    │   ├── blob.rs       # Blobstore API
-    │   ├── nvme.rs       # NVMe driver API
+    │   ├── bdev.rs       # Bdev/BdevDesc block device API
     │   ├── channel.rs    # I/O channel management
-    │   ├── dma.rs        # DMA buffer management
     │   ├── error.rs      # Error types
-    │   └── complete.rs   # Callback-to-future utilities
+    │   ├── poller.rs     # SPDK poller (async task) [planned]
+    │   ├── blob.rs       # Blobstore API [planned]
+    │   ├── nvme.rs       # NVMe driver API [planned]
+    │   ├── dma.rs        # DMA buffer management [planned]
+    │   └── complete.rs   # Callback-to-future utilities [planned]
+    ├── tests/
+    │   ├── app_test.rs   # SpdkApp simple test
+    │   ├── bdev_test.rs  # Bdev/BdevDesc with null bdev
+    │   ├── env_init.rs   # SpdkEnv initialization test
+    │   ├── mempool_test.rs
+    │   └── thread_test.rs
     └── Cargo.toml
 ```
 
@@ -270,20 +290,21 @@ fn main() {
 }
 
 async fn run_app(thread: &SpdkThread) -> Result<(), SpdkError> {
-    // Get bdev by name
-    let bdev = Bdev::get_by_name("Nvme0n1").await?;
+    // Get bdev by name (sync lookup)
+    let bdev = Bdev::get_by_name("Nvme0n1")
+        .ok_or(SpdkError::DeviceNotFound("Nvme0n1".into()))?;
     
-    // Open with read-write access
-    let desc = bdev.open(true).await?;
+    // Open with read-write access (sync)
+    let desc = bdev.open(true)?;
     
-    // Get I/O channel from thread handle (explicit, no globals)
-    let channel = thread.get_io_channel(&desc)?;
+    // Get I/O channel from descriptor (bound to current thread)
+    let channel = desc.get_io_channel()?;
     
     // Allocate DMA buffer
     let mut buf = DmaBuf::alloc(4096, 4096)?;
     
-    // Async read
-    desc.read(channel, &mut buf, 0, 4096).await?;
+    // Async read (future work)
+    desc.read(&channel, &mut buf, 0, 4096).await?;
     
     Ok(())
 }
@@ -386,6 +407,10 @@ impl SpdkEnvBuilder {
 }
 ```
 
+> **Note:** `SpdkEnv` only initializes the DPDK environment. For bdev subsystem and
+> JSON configuration support, use [`SpdkApp`](#application-framework-spdkapp) instead.
+```
+
 #### Privilege Requirements
 
 SPDK/DPDK typically requires elevated privileges for:
@@ -410,63 +435,486 @@ sudo /path/to/spdk/scripts/setup.sh
 ./my_app
 ```
 
-### Thread API (modeled after std::thread)
+### Application Framework (SpdkApp)
+
+While `SpdkEnv` provides low-level environment initialization via `spdk_env_init()`, most SPDK 
+applications should use the **SPDK Application Framework** which handles:
+
+1. Environment initialization (DPDK/hugepages)
+2. All subsystem initialization (bdev, nvmf, etc.)
+3. JSON configuration loading (bdevs, etc.)
+4. Reactor/poller infrastructure
+5. Signal handling and graceful shutdown
+
+**Comparison:**
+
+| Feature | `SpdkEnv` (low-level) | `SpdkApp` (framework) |
+|---------|----------------------|----------------------|
+| Init via | `spdk_env_init()` | `spdk_app_start()` |
+| Subsystems | Manual init required | Auto-initialized |
+| JSON config | Not supported | Native support |
+| Bdev creation | Need internal headers | Via JSON config |
+| Main loop | User-managed | Framework-managed |
+| Use case | Embedding, custom apps | Typical SPDK apps |
 
 ```rust
-/// SPDK thread handle - !Send, must stay on creating OS thread
-/// Owns I/O channel cache and provides thread-bound operations
-pub struct SpdkThread { /* NonNull<spdk_thread>, channel cache */ }
+/// SPDK Application Framework - full subsystem initialization
+/// 
+/// Uses `spdk_app_start()` which initializes:
+/// - DPDK environment
+/// - All registered SPDK subsystems (bdev, etc.)
+/// - JSON-RPC server (optional)
+/// - Reactor/poller infrastructure
+/// 
+/// The application runs inside the framework's main loop.
+/// 
+/// # Thread Model
+/// `spdk_app_start()` takes over the calling thread and runs the SPDK
+/// reactor on it. The user callback runs on this "main" reactor thread.
+pub struct SpdkApp {
+    _private: (),
+}
 
-/// Handle to a spawned SPDK thread (like std::thread::JoinHandle)
-pub struct JoinHandle<T> { /* ... */ }
+/// Builder for SPDK Application Framework
+pub struct SpdkAppBuilder {
+    name: Option<String>,
+    config_file: Option<String>,   // JSON config file path
+    reactor_mask: Option<String>,  // CPU mask for reactors
+    main_core: Option<i32>,
+    mem_size_mb: Option<i32>,
+    no_pci: bool,
+    rpc_addr: Option<String>,      // Unix socket for JSON-RPC
+    shm_id: Option<i32>,
+    log_level: Option<LogLevel>,
+}
 
-impl<T> JoinHandle<T> {
-    pub fn join(self) -> Result<T>;
-    pub fn thread(&self) -> &SpdkThread;  // Get reference to the thread
+impl SpdkAppBuilder {
+    pub fn new() -> Self;
+    
+    /// Application name (used for hugepage files, logs)
+    pub fn name(self, name: &str) -> Self;
+    
+    /// Path to JSON config file for bdev/subsystem configuration
+    /// 
+    /// Example config file:
+    /// ```json
+    /// {
+    ///   "subsystems": [{
+    ///     "subsystem": "bdev",
+    ///     "config": [{
+    ///       "method": "bdev_null_create",
+    ///       "params": {
+    ///         "name": "Null0",
+    ///         "num_blocks": 262144,
+    ///         "block_size": 512
+    ///       }
+    ///     }]
+    ///   }]
+    /// }
+    /// ```
+    pub fn config_file(self, path: &str) -> Self;
+    
+    /// CPU core mask for SPDK reactors (e.g., "0x3" for cores 0,1)
+    pub fn reactor_mask(self, mask: &str) -> Self;
+    
+    /// Main (first) reactor core
+    pub fn main_core(self, core: i32) -> Self;
+    
+    /// Hugepage memory size in MB
+    pub fn mem_size_mb(self, mb: i32) -> Self;
+    
+    /// Disable PCI device scanning
+    pub fn no_pci(self, no_pci: bool) -> Self;
+    
+    /// JSON-RPC server socket path (e.g., "/var/tmp/spdk.sock")
+    pub fn rpc_addr(self, addr: &str) -> Self;
+    
+    /// Shared memory ID for multi-process
+    pub fn shm_id(self, id: i32) -> Self;
+    
+    /// SPDK log level
+    pub fn log_level(self, level: LogLevel) -> Self;
+    
+    /// Run application with synchronous callback
+    /// 
+    /// The callback runs on the main SPDK reactor thread.
+    /// When callback returns, SPDK shuts down.
+    /// 
+    /// # Example
+    /// ```rust
+    /// SpdkApp::builder()
+    ///     .name("my_app")
+    ///     .config_file("./config.json")
+    ///     .run(|| {
+    ///         // Bdevs from config.json are now available
+    ///         let bdev = Bdev::get_by_name("Null0").unwrap();
+    ///         let desc = bdev.open(true).unwrap();
+    ///         // ...
+    ///         SpdkApp::stop(); // Signal shutdown
+    ///     })
+    ///     .expect("SPDK app failed");
+    /// ```
+    pub fn run<F>(self, f: F) -> Result<()>
+    where
+        F: FnOnce() + 'static;
+    
+    /// Run application with async main function
+    /// 
+    /// Spawns a poller-based executor and runs the future.
+    /// 
+    /// # Example
+    /// ```rust
+    /// SpdkApp::builder()
+    ///     .name("my_app")
+    ///     .config_file("./config.json")
+    ///     .block_on(async {
+    ///         let bdev = Bdev::get_by_name("Null0").unwrap();
+    ///         let desc = bdev.open(true).unwrap();
+    ///         let channel = desc.get_io_channel().unwrap();
+    ///         
+    ///         // Async I/O
+    ///         desc.read(&channel, 0, &mut buf).await?;
+    ///         
+    ///         Ok(())
+    ///     })
+    ///     .expect("SPDK app failed");
+    /// ```
+    pub fn block_on<F, T>(self, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>> + 'static,
+        T: 'static;
+}
+
+impl SpdkApp {
+    pub fn builder() -> SpdkAppBuilder {
+        SpdkAppBuilder::new()
+    }
+    
+    /// Signal SPDK to shut down gracefully
+    /// 
+    /// Can be called from any reactor thread.
+    pub fn stop() {
+        unsafe { spdk_app_stop(0); }
+    }
+    
+    /// Request application shutdown (alternative to stop)
+    pub fn start_shutdown() {
+        unsafe { spdk_app_start_shutdown(); }
+    }
 }
 ```
 
-### I/O Device Abstraction
+#### SpdkApp vs SpdkEnv: When to Use Which
+
+**Use `SpdkApp` when:**
+- Building a typical SPDK application
+- Need bdev/nvmf/other subsystems
+- Want JSON config for bdevs
+- Need graceful signal handling
+- Want the standard SPDK application model
+
+**Use `SpdkEnv` when:**
+- Embedding SPDK in an existing application
+- Only need NVMe driver (no bdev layer)
+- Custom threading model required
+- Need fine-grained control over initialization
+- Building a custom subsystem
+
+#### Implementation Notes
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      spdk_app_start() Flow                          │
+├─────────────────────────────────────────────────────────────────────┤
+│  1. Parse options (core mask, mem size, config file)                │
+│  2. Call spdk_env_init() internally                                 │
+│  3. Initialize SPDK thread library                                  │
+│  4. Initialize all registered subsystems (bdev, nvmf, etc.)         │
+│  5. Load JSON config if provided (creates bdevs, etc.)              │
+│  6. Start JSON-RPC server if configured                             │
+│  7. Call user's start callback                                      │
+│  8. Run reactor main loop (polling)                                 │
+│  9. On shutdown: finalize subsystems, cleanup                       │
+│ 10. Call spdk_app_fini() and return                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Async Executor Integration:**
+
+For `block_on()`, we use SPDK's poller mechanism:
 
 ```rust
-/// Opaque I/O device identifier (type-safe wrapper for SPDK's void* io_device)
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IoDeviceId(NonNull<c_void>);
+impl SpdkAppBuilder {
+    pub fn block_on<F, T>(self, future: F) -> Result<T> {
+        let output: Cell<Option<T>> = Cell::new(None);
+        let output_ptr = &output as *const _ as *mut Option<T>;
+        
+        self.run(move || {
+            // Register a poller that drives the future
+            let waker = spdk_poller_waker();
+            let mut future = pin!(future);
+            
+            // Use spdk_poller_register to poll the future
+            let poller = Poller::register(move || {
+                let cx = &mut Context::from_waker(&waker);
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        unsafe { *output_ptr = Some(result?); }
+                        SpdkApp::stop();
+                        PollStatus::Stop
+                    }
+                    Poll::Pending => PollStatus::Busy,
+                }
+            });
+        })?;
+        
+        output.into_inner().ok_or(Error::NoOutput)
+    }
+}
+```
 
-/// Trait for types that can provide thread-local I/O channels
-pub trait IoDevice {
-    fn io_device_id(&self) -> IoDeviceId;
+### Thread API
+
+```rust
+/// Constants for message mempool sizing
+pub const DEFAULT_MSG_MEMPOOL_SIZE: usize = 262144 - 1;  // Production
+pub const SMALL_MSG_MEMPOOL_SIZE: usize = 1023;          // Testing (no hugepages)
+
+/// Initialize thread library (called automatically by SpdkThread::new)
+pub fn thread_lib_init() -> Result<()>;
+pub fn thread_lib_init_ext(msg_mempool_size: usize) -> Result<()>;
+
+/// SPDK thread context - !Send + !Sync, must stay on creating OS thread.
+/// This is a lightweight scheduling context, NOT an OS thread.
+pub struct SpdkThread {
+    ptr: NonNull<spdk_thread>,
+    _marker: PhantomData<*mut ()>,  // Prevents Send/Sync
 }
 
-/// Per-thread I/O channel (obtained via SpdkThread::get_io_channel)
-pub struct IoChannel { /* NonNull<spdk_io_channel> */ }
+impl SpdkThread {
+    /// Attach an SPDK thread to the current OS thread.
+    /// Thread library is initialized automatically if needed.
+    pub fn current(name: &str) -> Result<Self>;
+    
+    /// Alias for current() - for familiarity with std::thread::spawn
+    pub fn new(name: &str) -> Result<Self>;
+    
+    /// Attach with custom message mempool size (for testing without hugepages).
+    pub fn current_with_mempool_size(name: &str, size: usize) -> Result<Self>;
+    pub fn new_with_mempool_size(name: &str, size: usize) -> Result<Self>;
+    
+    /// Get the SPDK thread attached to the current OS thread.
+    pub fn get_current() -> Option<CurrentThread>;
+    
+    /// Get the app thread (first thread created).
+    pub fn app_thread() -> Option<CurrentThread>;
+    
+    /// Poll to process messages and run pollers. Returns work count.
+    pub fn poll(&self) -> i32;
+    pub fn poll_max(&self, max_msgs: u32) -> i32;
+    
+    /// Query thread state
+    pub fn has_active_pollers(&self) -> bool;
+    pub fn has_pollers(&self) -> bool;
+    pub fn is_idle(&self) -> bool;
+    pub fn is_running(&self) -> bool;
+    pub fn name(&self) -> &str;
+    pub fn id(&self) -> u64;
+    
+    /// Get total number of SPDK threads
+    pub fn count() -> u32;
+    
+    /// Raw pointer access
+    pub fn as_ptr(&self) -> *mut spdk_thread;
+}
+
+impl Drop for SpdkThread {
+    fn drop(&mut self) {
+        // 1. Request thread exit
+        // 2. Poll until exited
+        // 3. Clear current thread
+        // 4. Destroy thread
+        // 5. If last thread, finalize library
+    }
+}
+
+/// Borrowed reference to an SPDK thread (does not own it).
+/// Returned by SpdkThread::get_current().
+pub struct CurrentThread {
+    ptr: NonNull<spdk_thread>,
+    _marker: PhantomData<*mut ()>,
+}
+
+impl CurrentThread {
+    pub fn poll(&self) -> i32;
+    pub fn name(&self) -> &str;
+    pub fn id(&self) -> u64;
+    pub fn as_ptr(&self) -> *mut spdk_thread;
+}
+```
+
+### I/O Channel Design
+
+SPDK uses **per-thread I/O channels** for lock-free I/O submission. Each channel is:
+- Bound to the OS thread that created it
+- Reference-counted (getting the same channel twice returns the same pointer)
+- Released asynchronously via `spdk_put_io_channel()`
+
+**SPDK APIs:**
+- `spdk_bdev_get_io_channel(desc)` - Get channel for block device
+- `spdk_bs_alloc_io_channel(bs)` - Get channel for blobstore  
+- `spdk_get_io_channel(io_device)` - Generic (rarely used directly)
+- `spdk_put_io_channel(ch)` - Release channel
+- `spdk_io_channel_get_thread(ch)` - Get thread owning channel
+
+```rust
+/// Per-thread I/O channel.
+/// 
+/// Must be created and used on the same OS thread. Implements Drop
+/// to release via spdk_put_io_channel().
+/// 
+/// # Thread Safety
+/// `!Send + !Sync` - must stay on creating thread.
+pub struct IoChannel {
+    ptr: NonNull<spdk_io_channel>,
+    _marker: PhantomData<*mut ()>,
+}
+
+impl IoChannel {
+    /// Get the thread this channel is bound to.
+    pub fn thread(&self) -> CurrentThread;
+    
+    /// Get the raw pointer.
+    pub fn as_ptr(&self) -> *mut spdk_io_channel;
+}
+
+impl Drop for IoChannel {
+    fn drop(&mut self) {
+        unsafe { spdk_put_io_channel(self.ptr.as_ptr()) };
+    }
+}
 ```
 
 ### Block Device API
 
 ```rust
-/// Block device handle (does not own the device)
-pub struct Bdev { /* NonNull<spdk_bdev> */ }
+/// Block device handle (does not own the device).
+/// 
+/// Obtained via `Bdev::get_by_name()` after bdevs are created via JSON config.
+/// The bdev itself is managed by SPDK's bdev layer.
+/// 
+/// # Creating Bdevs
+/// Bdevs are created at SPDK init time via `SpdkAppBuilder::config_file()`:
+/// ```rust
+/// // config.json:
+/// // {"subsystems": [{"subsystem": "bdev", "config": [
+/// //   {"method": "bdev_null_create", "params": {"name": "Null0", "num_blocks": 262144, "block_size": 512}}
+/// // ]}]}
+/// 
+/// SpdkApp::builder()
+///     .name("app")
+///     .config_file("./config.json")
+///     .mem_size_mb(512)
+///     .run(|| {
+///         let bdev = Bdev::get_by_name("Null0").unwrap();
+///         // ... use bdev
+///         SpdkApp::stop();
+///     })?;
+/// ```
+/// 
+/// # Thread Safety
+/// `!Send + !Sync` - conservative default, may relax later.
+pub struct Bdev {
+    ptr: NonNull<spdk_bdev>,
+    _marker: PhantomData<*mut ()>,
+}
 
-/// Open descriptor to a bdev (like file descriptor)
-/// Implements IoDevice trait for channel creation
-pub struct BdevDesc { /* NonNull<spdk_bdev_desc> */ }
+impl Bdev {
+    /// Look up a bdev by name.
+    /// 
+    /// Returns `None` if no bdev with that name exists.
+    pub fn get_by_name(name: &str) -> Option<Self>;
+    
+    /// Open this bdev for I/O.
+    /// 
+    /// # Arguments
+    /// * `write` - true for read/write access, false for read-only
+    pub fn open(&self, write: bool) -> Result<BdevDesc>;
+    
+    /// Get bdev name.
+    pub fn name(&self) -> &str;
+    
+    /// Get block size in bytes.
+    pub fn block_size(&self) -> u32;
+    
+    /// Get number of blocks.
+    pub fn num_blocks(&self) -> u64;
+    
+    /// Get total size in bytes.
+    pub fn size_bytes(&self) -> u64;
+    
+    /// Get raw pointer.
+    pub fn as_ptr(&self) -> *mut spdk_bdev;
+}
 
-/// DMA-capable buffer
-pub struct DmaBuf { /* ptr, len */ }
+/// Open descriptor to a bdev (like a file descriptor).
+/// 
+/// Use `get_io_channel()` to obtain a thread-local channel for I/O.
+/// Must be closed on the same thread it was opened on.
+/// 
+/// # Thread Safety
+/// `!Send + !Sync` - must stay on opening thread for close.
+pub struct BdevDesc {
+    ptr: NonNull<spdk_bdev_desc>,
+    _marker: PhantomData<*mut ()>,
+}
+
+impl BdevDesc {
+    /// Get an I/O channel for this descriptor on the current thread.
+    pub fn get_io_channel(&self) -> Result<IoChannel>;
+    
+    /// Get the underlying bdev.
+    pub fn bdev(&self) -> Bdev;
+    
+    /// Get raw pointer.
+    pub fn as_ptr(&self) -> *mut spdk_bdev_desc;
+}
+
+impl Drop for BdevDesc {
+    fn drop(&mut self) {
+        // Must be called on same thread as open
+        unsafe { spdk_bdev_close(self.ptr.as_ptr()) };
+    }
+}
 ```
+
 
 ### Blobstore API
 
 ```rust
-/// Blobstore instance
-/// Implements IoDevice trait for channel creation
-pub struct Blobstore { /* NonNull<spdk_blob_store> */ }
+/// Blobstore instance.
+/// 
+/// Use `alloc_io_channel()` to get a thread-local channel.
+pub struct Blobstore {
+    ptr: NonNull<spdk_blob_store>,
+}
 
-/// Blob handle
-pub struct Blob { /* NonNull<spdk_blob> */ }
+impl Blobstore {
+    /// Allocate an I/O channel for this blobstore on the current thread.
+    pub fn alloc_io_channel(&self) -> Result<IoChannel> {
+        let ch = unsafe { spdk_bs_alloc_io_channel(self.ptr.as_ptr()) };
+        NonNull::new(ch)
+            .map(|ptr| IoChannel { ptr, _marker: PhantomData })
+            .ok_or(Error::ChannelAlloc)
+    }
+}
 
-/// Blob identifier
+/// Blob handle.
+pub struct Blob {
+    ptr: NonNull<spdk_blob>,
+}
+
+/// Blob identifier.
 pub struct BlobId(spdk_blob_id);
 ```
 
@@ -546,80 +994,68 @@ impl Drop for IoChannel {
 
 ### Send/Sync Considerations
 
-- `SpdkThread`: `!Send + !Sync` (bound to OS thread, like `std::thread::Thread`)
-- `Bdev`: `Send + Sync` (immutable reference to device metadata)
-- `BdevDesc`: `Send` (can be moved between threads, but I/O needs thread's channel)
+- `SpdkThread`: `!Send + !Sync` (bound to OS thread)
+- `Bdev`: `!Send + !Sync` (conservative default, may relax later)
+- `BdevDesc`: `!Send + !Sync` (must close on opening thread)
 - `IoChannel`: `!Send + !Sync` (must stay on creating thread)
 - `DmaBuf`: `Send` (can be moved, but not shared during I/O)
 
-### Explicit Handle Model (like std::thread)
+### Explicit Handle Model
 
-No thread-local statics needed. The `SpdkThread` handle is passed explicitly:
+No thread-local statics needed. Channels are obtained from the device, not the thread:
 
 ```rust
-/// Opaque I/O device identifier
-/// Wraps SPDK's void* io_device pointer in a type-safe way
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct IoDeviceId(pub(crate) NonNull<c_void>);
-
-/// Trait for types that can provide an I/O channel
-/// Implemented by BdevDesc, Blobstore, etc.
-pub trait IoDevice {
-    fn io_device_id(&self) -> IoDeviceId;
-}
-
-/// SPDK thread handle - must stay on the OS thread that created it
-/// Similar to how std::thread::JoinHandle works
+/// SPDK thread handle - !Send + !Sync, bound to creating OS thread
+/// 
+/// IMPLEMENTED:
+/// - Lightweight scheduling context (not an OS thread)
+/// - Polling for message processing and poller execution
+/// - Thread state queries (is_idle, is_running, etc.)
+/// - Automatic cleanup on drop
+/// 
+/// PLANNED:
+/// - SpdkThread::spawn() for spawning new OS thread + SPDK thread
 pub struct SpdkThread {
     ptr: NonNull<spdk_thread>,
-    /// Cached I/O channels by device ID (avoids duplicate channel creation)
-    channels: RefCell<HashMap<IoDeviceId, IoChannel>>,
-    /// Prevent Send/Sync - must stay on creating OS thread
     _marker: PhantomData<*mut ()>,
 }
 
 impl SpdkThread {
-    /// Attach an SPDK thread context to the CURRENT OS thread
-    /// Does NOT create a new OS thread - you're already on one
-    /// The SPDK thread is a lightweight scheduling context, not a real thread
-    pub fn current(name: &str) -> Result<Self>;
+    // === IMPLEMENTED ===
     
-    /// Spawn a NEW OS thread with an SPDK thread context attached
-    /// Creates: 1 new OS thread + 1 SPDK thread bound to it
-    /// The closure runs on the new OS thread
+    pub fn current(name: &str) -> Result<Self>;
+    pub fn new(name: &str) -> Result<Self>;
+    pub fn current_with_mempool_size(name: &str, size: usize) -> Result<Self>;
+    pub fn get_current() -> Option<CurrentThread>;
+    pub fn app_thread() -> Option<CurrentThread>;
+    pub fn poll(&self) -> i32;
+    pub fn poll_max(&self, max_msgs: u32) -> i32;
+    pub fn has_active_pollers(&self) -> bool;
+    pub fn has_pollers(&self) -> bool;
+    pub fn is_idle(&self) -> bool;
+    pub fn is_running(&self) -> bool;
+    pub fn name(&self) -> &str;
+    pub fn id(&self) -> u64;
+    pub fn count() -> u32;
+    
+    // === PLANNED ===
+    
     pub fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
     where
         F: FnOnce(&SpdkThread) -> T + Send + 'static,
         T: Send + 'static;
-    
-    /// Poll this thread's work queue
-    /// Returns number of events processed (0 = idle)
-    pub fn poll(&self) -> i32;
-    
-    /// Get or create I/O channel for a device
-    /// Channels are cached - calling twice with same device returns same channel
-    pub fn get_io_channel<D: IoDevice>(&self, device: &D) -> Result<&IoChannel>;
-    
-    /// Check if thread has pending work
-    pub fn is_idle(&self) -> bool;
-    
-    /// Mark thread for exit and drain pending work
-    pub fn exit(&self);
 }
 
-// Example IoDevice implementations:
+// Channel acquisition is per-device, not per-thread:
 
-impl IoDevice for BdevDesc {
-    fn io_device_id(&self) -> IoDeviceId {
-        // spdk_bdev_desc is the io_device for bdev channels
-        IoDeviceId(self.ptr.cast())
-    }
+impl BdevDesc {
+    /// Get thread-local I/O channel for this device
+    pub fn get_io_channel(&self) -> Result<IoChannel>;
 }
 
-impl IoDevice for Blobstore {
-    fn io_device_id(&self) -> IoDeviceId {
-        IoDeviceId(self.ptr.cast())
-    }
+impl Blobstore {
+    /// Allocate thread-local I/O channel for this blobstore
+    pub fn alloc_io_channel(&self) -> Result<IoChannel>;
 }
 ```
 
@@ -635,9 +1071,8 @@ fn main() {
     let thread = SpdkThread::current("main").unwrap();
     run_with_thread(&thread);
     
-    // Option 2: Spawn new thread (like std::thread::spawn)
+    // Option 2: Spawn new thread (like std::thread::spawn) - PLANNED
     let handle = SpdkThread::spawn("worker", |thread| {
-        // thread handle passed to closure
         run_with_thread(thread)
     });
     handle.join().unwrap();
@@ -648,12 +1083,18 @@ fn run_with_thread(thread: &SpdkThread) -> Result<()> {
     futures_lite::future::block_on(ex.run(async {
         ex.spawn(poller_task(thread)).detach();
         
-        // Pass thread explicitly to get channels
-        let bdev = Bdev::get_by_name("Nvme0n1").await?;
-        let desc = bdev.open(true).await?;
-        let channel = thread.get_io_channel(&desc)?;
+        // Get device and open it (sync)
+        let bdev = Bdev::get_by_name("Nvme0n1")
+            .ok_or(Error::DeviceNotFound("Nvme0n1".into()))?;
+        let desc = bdev.open(true)?;
         
-        // Use channel for I/O...
+        // Get I/O channel FROM THE DESCRIPTOR (not the thread)
+        let channel = desc.get_io_channel()?;
+        
+        // Use channel for I/O (async read/write - future work)
+        let mut buf = DmaBuf::alloc(4096, 4096)?;
+        desc.read(&channel, &mut buf, 0, 4096).await?;
+        
         Ok(())
     }))
 }
@@ -676,76 +1117,116 @@ SPDK provides virtual bdev modules for testing without real NVMe hardware:
 
 ### Creating Test Bdevs
 
+Test bdevs are created via JSON config file with `SpdkApp`:
+
 ```rust
-/// Create a RAM-backed bdev for testing
-impl Bdev {
-    /// Create malloc (RAM-backed) bdev
-    /// Does NOT require real NVMe hardware or elevated privileges (after env init)
-    pub fn create_malloc(name: &str, size_bytes: u64, block_size: u32) -> Result<Self>;
-    
-    /// Create null bdev (discards writes, returns zeros)
-    pub fn create_null(name: &str, size_bytes: u64, block_size: u32) -> Result<Self>;
-    
-    /// Destroy a bdev by name
-    pub fn destroy(name: &str) -> Result<()>;
-}
+// config.json
+// {
+//   "subsystems": [{
+//     "subsystem": "bdev",
+//     "config": [{
+//       "method": "bdev_null_create",
+//       "params": {"name": "Null0", "num_blocks": 262144, "block_size": 512}
+//     }]
+//   }]
+// }
+
+SpdkApp::builder()
+    .name("test")
+    .config_file("./config.json")
+    .run(|| {
+        // Bdev is now available
+        let bdev = Bdev::get_by_name("Null0").unwrap();
+        // ...
+        SpdkApp::stop();
+    })?;
 ```
+
+JSON config methods for bdevs:
+- `bdev_null_create` - discards writes, returns zeros (simplest)
+- `bdev_malloc_create` - RAM-backed block device
+- `bdev_error_create` - injects I/O errors
+- `bdev_delay_create` - adds configurable latency
 
 ### Unit Test Example
 
 ```rust
 #[cfg(test)]
 mod tests {
-    use spdk_io::{SpdkEnv, SpdkThread, Bdev, DmaBuf, poller_task};
+    use spdk_io::{SpdkApp, Bdev};
+    use std::fs;
     
-    // Note: SPDK tests still need env init (hugepages)
-    // Use a test harness that initializes once per test binary
-    
-    fn with_spdk<F, T>(f: F) -> T 
-    where
-        F: FnOnce(&SpdkThread) -> T
-    {
-        // In real tests, use lazy_static or ctor for one-time init
-        // Use no_huge for CI without hugepage configuration
-        let _env = SpdkEnv::builder()
-            .name("test")
-            .no_pci(true)
-            .no_huge(true)
-            .mem_size_mb(64)
-            .build()
-            .unwrap();
-        
-        let thread = SpdkThread::current("test").unwrap();
-        f(&thread)
+    // Write test config to temp file
+    fn create_test_config() -> String {
+        let config = r#"{
+            "subsystems": [{
+                "subsystem": "bdev",
+                "config": [{
+                    "method": "bdev_null_create",
+                    "params": {"name": "test0", "num_blocks": 1024, "block_size": 512}
+                }]
+            }]
+        }"#;
+        let path = "/tmp/spdk_test_config.json";
+        fs::write(path, config).unwrap();
+        path.to_string()
     }
     
     #[test]
-    fn test_read_write_malloc() {
-        with_spdk(|thread| {
-            let ex = smol::LocalExecutor::new();
-            futures_lite::future::block_on(ex.run(async {
-                ex.spawn(poller_task(thread)).detach();
+    fn test_null_bdev() {
+        let config_path = create_test_config();
+        
+        SpdkApp::builder()
+            .name("test")
+            .config_file(&config_path)
+            .run(|| {
+                // Null bdev was created via JSON config at init
+                let bdev = Bdev::get_by_name("test0").unwrap();
+                assert_eq!(bdev.name(), "test0");
+                assert_eq!(bdev.block_size(), 512);
+                assert_eq!(bdev.num_blocks(), 1024);
                 
-                // Create 1MB RAM-backed bdev
-                let bdev = Bdev::create_malloc("test0", 1024 * 1024, 4096).unwrap();
-                let desc = bdev.open(true).await.unwrap();
-                let channel = thread.get_io_channel(&desc).unwrap();
+                // Open for read/write
+                let desc = bdev.open(true).unwrap();
                 
-                // Write pattern
-                let mut buf = DmaBuf::alloc(4096, 4096).unwrap();
-                buf.as_mut_slice().fill(0xAB);
-                desc.write(channel, &buf, 0, 4096).await.unwrap();
+                // Get I/O channel
+                let channel = desc.get_io_channel().unwrap();
                 
-                // Read back and verify
-                let mut read_buf = DmaBuf::alloc(4096, 4096).unwrap();
-                desc.read(channel, &mut read_buf, 0, 4096).await.unwrap();
-                assert_eq!(read_buf.as_slice(), buf.as_slice());
-                
-                // Cleanup
+                // Channel obtained successfully
+                drop(channel);
                 drop(desc);
-                Bdev::destroy("test0").unwrap();
-            }));
-        });
+                
+                SpdkApp::stop();
+            })
+            .expect("SPDK test failed");
+        
+        fs::remove_file(config_path).ok();
+    }
+    
+    #[test]
+    fn test_async_bdev_io() {
+        let config_path = create_test_config();
+        
+        SpdkApp::builder()
+            .name("test_async")
+            .config_file(&config_path)
+            .block_on(async {
+                let bdev = Bdev::get_by_name("test0").unwrap();
+                let desc = bdev.open(true).unwrap();
+                let channel = desc.get_io_channel().unwrap();
+                
+                // Async read (returns zeros for null bdev)
+                let mut buf = DmaBuf::alloc(512, 512)?;
+                desc.read(&channel, 0, &mut buf).await?;
+                
+                // Verify zeros
+                assert!(buf.iter().all(|&b| b == 0));
+                
+                Ok(())
+            })
+            .expect("Async test failed");
+        
+        fs::remove_file(config_path).ok();
     }
 }
 ```

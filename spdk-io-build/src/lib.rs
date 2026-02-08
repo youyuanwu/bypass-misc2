@@ -154,6 +154,15 @@ pub struct PkgConfigParser {
     /// be linked with [`LinkKind::Default`] (dynamic linking), even if
     /// the `.a` file exists. Default: `["/usr"]`.
     system_roots: Vec<PathBuf>,
+
+    /// Libraries that should always be linked with `+whole-archive`.
+    ///
+    /// This overrides the normal detection and forces these libraries
+    /// to use [`LinkKind::WholeArchive`] even if not in a `--whole-archive`
+    /// region from pkg-config. Useful for libraries with constructor
+    /// functions (like SPDK event subsystem registration) where the
+    /// pkg-config file doesn't include whole-archive flags.
+    force_whole_archive: HashSet<String>,
 }
 
 impl Default for PkgConfigParser {
@@ -168,10 +177,12 @@ impl PkgConfigParser {
     /// Defaults:
     /// - `no_bundle`: `true` (adds `-bundle` modifier)
     /// - `system_roots`: `["/usr"]`
+    /// - `force_whole_archive`: `[]` (empty)
     pub fn new() -> Self {
         Self {
             no_bundle: true,
             system_roots: vec![PathBuf::from("/usr")],
+            force_whole_archive: HashSet::new(),
         }
     }
 
@@ -212,6 +223,36 @@ impl PkgConfigParser {
         P: Into<PathBuf>,
     {
         self.system_roots = roots.into_iter().map(|p| p.into()).collect();
+        self
+    }
+
+    /// Sets libraries that should always use `+whole-archive`.
+    ///
+    /// These libraries will be linked with [`LinkKind::WholeArchive`] even if
+    /// they don't appear inside a `--whole-archive` region in the pkg-config
+    /// output. This is necessary for libraries that use constructor functions
+    /// (like SPDK event subsystem registration with `SPDK_SUBSYSTEM_REGISTER`)
+    /// where the symbols would otherwise be discarded by the linker.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use spdk_io_build::PkgConfigParser;
+    ///
+    /// // Force whole-archive for SPDK event subsystem libraries
+    /// let parser = PkgConfigParser::new()
+    ///     .force_whole_archive([
+    ///         "spdk_event_bdev",
+    ///         "spdk_event_accel",
+    ///         "spdk_event_sock",
+    ///     ]);
+    /// ```
+    pub fn force_whole_archive<I, S>(mut self, libs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.force_whole_archive = libs.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 
@@ -384,11 +425,13 @@ impl PkgConfigParser {
         }
 
         // Determine link kind based on:
-        // 1. Is it in a whole-archive region?
-        // 2. Does a static library (.a) exist in a non-system directory?
+        // 1. Is it forced to be whole-archive?
+        // 2. Is it in a whole-archive region?
+        // 3. Does a static library (.a) exist in a non-system directory?
         let has_static = self.is_static_available(lib_name, lib_dirs);
+        let forced_whole_archive = self.force_whole_archive.contains(lib_name);
 
-        let kind = if in_whole_archive_region && has_static {
+        let kind = if (in_whole_archive_region || forced_whole_archive) && has_static {
             LinkKind::WholeArchive
         } else if has_static {
             LinkKind::Static

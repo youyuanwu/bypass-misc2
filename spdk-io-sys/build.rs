@@ -29,8 +29,12 @@ fn main() {
         "spdk_rpc",
         "spdk_jsonrpc",
         "spdk_event",
+        "spdk_event_bdev", // Register bdev subsystem with event framework
         "spdk_bdev_malloc",
         "spdk_bdev_null",
+        "spdk_accel",      // Accel framework + software module
+        "spdk_sock",       // Socket abstraction
+        "spdk_sock_posix", // POSIX socket implementation
         "libdpdk",
         "spdk_syslibs", // System dependencies (isal, ssl, crypto, uuid, fuse3, aio, etc.)
     ];
@@ -56,7 +60,22 @@ fn main() {
     let pkg_config_path =
         env::var("PKG_CONFIG_PATH").unwrap_or_else(|_| "/opt/spdk/lib/pkgconfig".to_string());
 
-    let parser = PkgConfigParser::new();
+    // SPDK event subsystem libraries use SPDK_SUBSYSTEM_REGISTER() which creates
+    // constructor functions. These need --whole-archive or the linker will discard them.
+    // Bdev modules also use SPDK_BDEV_MODULE_REGISTER() with constructors.
+    // Accel modules use SPDK_ACCEL_MODULE_REGISTER() with constructors.
+    let parser = PkgConfigParser::new().force_whole_archive([
+        "spdk_event_bdev",
+        "spdk_event_accel",
+        "spdk_event_vmd",
+        "spdk_event_sock",
+        "spdk_event_iobuf",
+        "spdk_event_keyring",
+        "spdk_bdev_null",
+        "spdk_bdev_malloc",
+        "spdk_accel",      // Contains software accel module (accel_sw)
+        "spdk_sock_posix", // POSIX socket implementation
+    ]);
 
     parser
         .probe_and_emit(spdk_libs, Some(&pkg_config_path))

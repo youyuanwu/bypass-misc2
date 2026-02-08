@@ -72,20 +72,47 @@ We bypass this by parsing pkg-config output directly and emitting `rustc-link-li
 
 ### Implementation
 
-Created `spdk-io-build` crate with `PkgConfigParser` helper:
+The `spdk-io-build` crate provides `PkgConfigParser` with `force_whole_archive()` support:
 
 ```rust
-use spdk_io_build::{PkgConfigParser, COMMON_SYSTEM_LIBS, LinkKind};
+use spdk_io_build::PkgConfigParser;
 
 let parser = PkgConfigParser::new()
-    .system_libs(COMMON_SYSTEM_LIBS);  // pthread, numa, etc. → dynamic
+    .force_whole_archive([
+        // SPDK event subsystem libraries (SPDK_SUBSYSTEM_REGISTER() constructors)
+        "spdk_event_bdev",
+        "spdk_event_accel",
+        "spdk_event_vmd",
+        "spdk_event_sock",
+        "spdk_event_iobuf",
+        "spdk_event_keyring",
+        // Bdev modules (SPDK_BDEV_MODULE_REGISTER() constructors)
+        "spdk_bdev_null",
+        "spdk_bdev_malloc",
+        // Accel modules (SPDK_ACCEL_MODULE_REGISTER() constructors)
+        "spdk_accel",
+        // Socket implementations (SPDK_NET_IMPL_REGISTER() constructors)
+        "spdk_sock_posix",
+    ]);
 
 parser.probe_and_emit(&spdk_libs, Some(&pkg_config_path))
     .expect("pkg-config failed");
 
-// Emits: cargo:rustc-link-lib=static:+whole-archive,-bundle=rte_mempool_ring
+// Emits: cargo:rustc-link-lib=static:+whole-archive,-bundle=spdk_event_bdev
+//        cargo:rustc-link-lib=static:-bundle=spdk_log  (normal static for others)
 //        cargo:rustc-link-lib=pthread  (dynamic for system libs)
 ```
+
+### SPDK Libraries Requiring Whole-Archive
+
+Several SPDK library types use constructor macros that require `--whole-archive`:
+
+| Library Type | Constructor Macro | Example Libraries |
+|--------------|------------------|-------------------|
+| Event subsystems | `SPDK_SUBSYSTEM_REGISTER()` | spdk_event_bdev, spdk_event_accel, spdk_event_sock |
+| Bdev modules | `SPDK_BDEV_MODULE_REGISTER()` | spdk_bdev_null, spdk_bdev_malloc, spdk_bdev_nvme |
+| Accel modules | `SPDK_ACCEL_MODULE_REGISTER()` | spdk_accel (contains accel_sw) |
+| Socket impls | `SPDK_NET_IMPL_REGISTER()` | spdk_sock_posix |
 
 ### Attempted Solutions (Historical)
 
@@ -102,14 +129,27 @@ nm target/debug/deps/thread_test-* | grep -E "ops_mp_mc|mp_hdlr_init"
 # Should show: ops_mp_mc, mp_hdlr_init_ops_mp_mc
 ```
 
-Run the mempool test:
+Verify SPDK subsystem symbols are in binary:
 ```bash
-cargo test -p spdk-io --test mempool_test -- test_mempool_create
-# Should pass with "Mempool created successfully!"
+nm target/debug/deps/bdev_test-* | grep "g_spdk_subsystem_bdev"
+# Should show: g_spdk_subsystem_bdev, g_spdk_subsystem_bdev_register
+```
+
+Run tests:
+```bash
+# Basic mempool test
+cargo test -p spdk-io --test mempool_test -- --ignored
+
+# SpdkApp simple test
+cargo test -p spdk-io --test app_test -- --ignored
+
+# Bdev test with null bdev
+cargo test -p spdk-io --test bdev_test -- --ignored
 ```
 
 ## References
 
 - DPDK RTE_INIT: Uses `.init_array` section for constructor registration
+- SPDK SPDK_SUBSYSTEM_REGISTER: Same pattern for subsystem registration
 - Cargo link modifiers: `static:+whole-archive,-bundle=` (requires `-bundle` for `links` key crates)
 - SPDK pkg-config: `/opt/spdk/lib/pkgconfig/`

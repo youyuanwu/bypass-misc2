@@ -379,6 +379,20 @@ pub struct CurrentThread {
 }
 
 impl CurrentThread {
+    /// Create a CurrentThread from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must be a valid `spdk_thread` pointer and must remain
+    /// valid for the lifetime of the returned `CurrentThread`.
+    #[inline]
+    pub(crate) fn from_ptr(ptr: *mut spdk_thread) -> Self {
+        Self {
+            ptr: NonNull::new(ptr).expect("CurrentThread::from_ptr called with null"),
+            _marker: PhantomData,
+        }
+    }
+
     /// Poll the thread.
     pub fn poll(&self) -> i32 {
         unsafe { spdk_thread_poll(self.ptr.as_ptr(), 0, 0) }
