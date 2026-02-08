@@ -9,3 +9,6 @@ license.workspace = true
 description = "Build helper utilities for SPDK Rust bindings with proper whole-archive support"
 
 [dependencies]
+
+[dev-dependencies]
+tempfile = "3"

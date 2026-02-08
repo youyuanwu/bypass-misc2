@@ -9,7 +9,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use spdk_io_build::{COMMON_SYSTEM_LIBS, PkgConfigParser};
+use spdk_io_build::PkgConfigParser;
 
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
@@ -56,7 +56,7 @@ fn main() {
     let pkg_config_path =
         env::var("PKG_CONFIG_PATH").unwrap_or_else(|_| "/opt/spdk/lib/pkgconfig".to_string());
 
-    let parser = PkgConfigParser::new().system_libs(COMMON_SYSTEM_LIBS);
+    let parser = PkgConfigParser::new();
 
     parser
         .probe_and_emit(spdk_libs, Some(&pkg_config_path))
