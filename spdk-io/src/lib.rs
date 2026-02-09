@@ -23,7 +23,10 @@
 //!
 //! - [`app`] - SPDK Application Framework (recommended for most apps)
 //! - [`bdev`] - Block device API
+//! - [`complete`] - Callback-to-future utilities
+//! - [`dma`] - DMA-capable buffer allocation
 //! - [`env`] - Low-level environment initialization  
+//! - [`poller`] - SPDK poller integration for async executors
 //! - [`thread`] - SPDK thread management
 //! - [`channel`] - I/O channel management
 //! - [`error`] - Error types
@@ -31,14 +34,20 @@
 pub mod app;
 pub mod bdev;
 pub mod channel;
+pub mod complete;
+pub mod dma;
 pub mod env;
 pub mod error;
+pub mod poller;
 pub mod thread;
 
 // Re-exports
 pub use app::{SpdkApp, SpdkAppBuilder};
 pub use bdev::{Bdev, BdevDesc};
 pub use channel::IoChannel;
+pub use complete::{CompletionReceiver, CompletionSender, block_on, completion, io_completion};
+pub use dma::DmaBuf;
 pub use env::{LogLevel, SpdkEnv, SpdkEnvBuilder};
 pub use error::{Error, Result};
-pub use thread::{CurrentThread, SpdkThread};
+pub use poller::{spdk_poller, spdk_poller_limited};
+pub use thread::{CurrentThread, JoinHandle, SpdkThread, ThreadHandle};

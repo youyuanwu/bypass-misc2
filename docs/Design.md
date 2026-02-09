@@ -18,15 +18,22 @@
 | - `PkgConfigParser` | ✅ | Parses pkg-config with whole-archive region tracking |
 | - Static detection | ✅ | Auto-detects `.a` availability, excludes system roots |
 | - `force_whole_archive` | ✅ | Force whole-archive for specific libs (subsystem constructors) |
-| **spdk-io crate** | 🟡 | Core types implemented |
+| **spdk-io crate** | ✅ | Core async I/O API complete |
 | - `SpdkEnv` | ✅ | Environment guard with RAII cleanup |
 | - `SpdkEnvBuilder` | ✅ | Full configuration: name, core_mask, mem_size, shm_id, no_pci, no_huge, main_core |
 | - `SpdkApp` | ✅ | Full application framework via `spdk_app_start()` |
-| - `SpdkAppBuilder` | ✅ | Builder for app: name, config_file, reactor_mask, rpc_addr, mem_size_mb, no_pci, no_huge |
+| - `SpdkAppBuilder` | ✅ | Builder for app: name, config_file, json_data, reactor_mask, rpc_addr, mem_size_mb, no_pci, no_huge, `run()`, `run_async()` |
 | - `Bdev` | ✅ | Block device handle with lookup by name |
-| - `BdevDesc` | ✅ | Open bdev descriptor for I/O operations |
+| - `BdevDesc` | ✅ | Open bdev descriptor with async `read()` and `write()` |
+| - `DmaBuf` | ✅ | DMA-capable buffer allocation via `spdk_dma_malloc()` |
+| - `Completion` | ✅ | Callback-to-future utilities for async I/O |
+| - `block_on` | ✅ | Block on futures while polling SPDK thread |
+| - `spdk_poller` | ✅ | Async task for executor integration |
 | - `SpdkThread` | ✅ | Thread context with polling, `!Send + !Sync` |
+| - `SpdkThread::spawn()` | ✅ | Spawn OS thread with SPDK context |
+| - `JoinHandle` | ✅ | Handle for spawned thread with join() |
 | - `CurrentThread` | ✅ | Borrowed reference to attached thread |
+| - `ThreadHandle` | ✅ | Thread-safe handle for cross-thread messaging via `spdk_thread_send_msg()` |
 | - `IoChannel` | ✅ | Per-thread I/O channel wrapper, `!Send + !Sync` |
 | - `Error` types | ✅ | Comprehensive error enum with thiserror |
 | - Integration tests | ✅ | vdev mode (no hugepages required) |
@@ -36,18 +43,14 @@
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| SPDK poller task | ⏳ | Async executor integration |
+| (none) | | |
 
 ### Planned
 
 | Component | Notes |
 |-----------|-------|
-| `DmaBuf` | DMA-capable buffer allocation |
-| Async read/write on `BdevDesc` | `read()`, `write()` with callback-to-future |
 | `Blobstore` / `Blob` | Blobstore API |
 | `NvmeController` | Direct NVMe access |
-| Callback-to-future utilities | `oneshot` channel pattern |
-| `SpdkThread::spawn()` | Spawn new OS thread + SPDK thread |
 
 ### Build & Linking
 
@@ -86,16 +89,16 @@ spdk-io/
     ├── src/
     │   ├── lib.rs
     │   ├── app.rs        # SpdkApp/SpdkAppBuilder (spdk_app_start framework)
-    │   ├── env.rs        # SpdkEnv/SpdkEnvBuilder (low-level env init)
-    │   ├── thread.rs     # SPDK thread management
-    │   ├── bdev.rs       # Bdev/BdevDesc block device API
+    │   ├── bdev.rs       # Bdev/BdevDesc block device API with async read/write
     │   ├── channel.rs    # I/O channel management
+    │   ├── complete.rs   # Callback-to-future utilities, block_on helper
+    │   ├── dma.rs        # DMA buffer management
+    │   ├── env.rs        # SpdkEnv/SpdkEnvBuilder (low-level env init)
     │   ├── error.rs      # Error types
-    │   ├── poller.rs     # SPDK poller (async task) [planned]
+    │   ├── poller.rs     # SPDK poller task for executor integration
+    │   ├── thread.rs     # SPDK thread management
     │   ├── blob.rs       # Blobstore API [planned]
-    │   ├── nvme.rs       # NVMe driver API [planned]
-    │   ├── dma.rs        # DMA buffer management [planned]
-    │   └── complete.rs   # Callback-to-future utilities [planned]
+    │   └── nvme.rs       # NVMe driver API [planned]
     ├── tests/
     │   ├── app_test.rs   # SpdkApp simple test
     │   ├── bdev_test.rs  # Bdev/BdevDesc with null bdev
@@ -752,6 +755,94 @@ impl CurrentThread {
     pub fn as_ptr(&self) -> *mut spdk_thread;
 }
 ```
+
+### Cross-Thread Messaging (Planned)
+
+SPDK provides `spdk_thread_send_msg()` for sending callbacks between threads.
+This is essential for multi-core scenarios where work needs to be dispatched
+across reactor cores.
+
+**Use cases:**
+- Dispatch I/O requests to worker threads
+- Return results to the requester's thread
+- Execute thread-bound operations (channel ops) on the correct thread
+- Load balancing across cores
+
+```rust
+/// Thread-safe handle for sending messages to an SPDK thread.
+///
+/// Unlike `SpdkThread` (which is `!Send`), this can be cloned and
+/// sent across OS threads. Use it to dispatch work to specific
+/// SPDK threads from anywhere.
+///
+/// Wraps `spdk_thread_send_msg()` which is thread-safe.
+#[derive(Clone)]
+pub struct ThreadHandle {
+    ptr: *const spdk_thread,
+}
+
+// Safe to send/share - spdk_thread_send_msg is thread-safe
+unsafe impl Send for ThreadHandle {}
+unsafe impl Sync for ThreadHandle {}
+
+impl ThreadHandle {
+    /// Send a closure to execute on the target thread.
+    ///
+    /// Returns immediately. The closure runs during the target's next poll.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let main_handle = main_thread.handle();
+    ///
+    /// SpdkThread::spawn("worker", move |worker| {
+    ///     // Do work on worker thread
+    ///     let result = compute_something();
+    ///
+    ///     // Send result back to main thread
+    ///     main_handle.send(move || {
+    ///         println!("Result: {}", result);
+    ///     });
+    ///
+    ///     for _ in 0..100 { worker.poll(); }
+    /// });
+    /// ```
+    pub fn send<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static;
+
+    /// Send a closure and await the result.
+    ///
+    /// Must be called from within an SPDK thread context.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Call a function on another thread and get result
+    /// let result = worker_handle.call(|| expensive_computation()).await;
+    /// ```
+    pub async fn call<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+
+    /// Get the target thread's ID.
+    pub fn id(&self) -> u64;
+}
+
+impl SpdkThread {
+    /// Get a clonable, thread-safe handle for message passing.
+    ///
+    /// The handle can be sent to other threads and used to dispatch
+    /// work back to this thread.
+    pub fn handle(&self) -> ThreadHandle;
+}
+```
+
+**Implementation notes:**
+- `send()` boxes the closure and passes pointer via `spdk_thread_send_msg()`
+- `call()` uses a oneshot channel: sends closure that sends result back
+- Handle is cheap to clone (just a pointer)
 
 ### I/O Channel Design
 

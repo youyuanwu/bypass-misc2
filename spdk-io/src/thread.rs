@@ -37,13 +37,15 @@
 //! }
 //! ```
 
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use spdk_io_sys::*;
 
+use crate::complete::{CompletionReceiver, completion};
 use crate::error::{Error, Result};
 
 /// Global flag to track if thread library is initialized
@@ -342,6 +344,102 @@ impl SpdkThread {
     pub fn as_ptr(&self) -> *mut spdk_thread {
         self.ptr.as_ptr()
     }
+
+    /// Spawn a new OS thread with an SPDK thread context.
+    ///
+    /// This creates a new OS thread and attaches a new SPDK thread to it.
+    /// The closure receives a reference to the `SpdkThread` which can be
+    /// used for polling and I/O operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for both the OS thread and SPDK thread
+    /// * `f` - Closure to run on the new thread
+    ///
+    /// # Returns
+    ///
+    /// A [`JoinHandle`] that can be used to wait for the thread to complete.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use spdk_io::{SpdkThread, spdk_poller};
+    ///
+    /// let handle = SpdkThread::spawn("worker", |thread| {
+    ///     // Run a polling loop
+    ///     for _ in 0..100 {
+    ///         thread.poll();
+    ///         std::thread::yield_now();
+    ///     }
+    ///     42 // Return value
+    /// });
+    ///
+    /// let result = handle.join().unwrap();
+    /// assert_eq!(result, 42);
+    /// ```
+    ///
+    /// # With async executor
+    ///
+    /// ```ignore
+    /// use spdk_io::{SpdkThread, spdk_poller, Bdev};
+    /// use async_executor::LocalExecutor;
+    ///
+    /// let handle = SpdkThread::spawn("io-worker", |_thread| {
+    ///     let ex = LocalExecutor::new();
+    ///     futures_lite::future::block_on(ex.run(async {
+    ///         ex.spawn(spdk_poller()).detach();
+    ///         
+    ///         // Do async I/O work
+    ///         let bdev = Bdev::get_by_name("Null0").unwrap();
+    ///         // ...
+    ///     }));
+    /// });
+    ///
+    /// handle.join().unwrap();
+    /// ```
+    pub fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
+    where
+        F: FnOnce(&SpdkThread) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let name_owned = name.to_string();
+
+        let handle = thread::Builder::new()
+            .name(name_owned.clone())
+            .spawn(move || {
+                // Create SPDK thread on this new OS thread
+                let spdk_thread = SpdkThread::current(&name_owned)
+                    .expect("Failed to create SPDK thread in spawned thread");
+
+                // Run the user's function (spdk_thread is dropped after f returns)
+                f(&spdk_thread)
+            })
+            .expect("Failed to spawn OS thread");
+
+        JoinHandle { handle }
+    }
+
+    /// Get a thread-safe handle for cross-thread message passing.
+    ///
+    /// The returned [`ThreadHandle`] can be cloned and sent to other threads.
+    /// Use it to dispatch work to this thread via [`ThreadHandle::send()`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let main_thread = SpdkThread::new("main")?;
+    /// let handle = main_thread.handle();
+    ///
+    /// // Send handle to another thread
+    /// SpdkThread::spawn("worker", move |_| {
+    ///     handle.send(|| println!("Hello from main thread!"));
+    /// });
+    /// ```
+    pub fn handle(&self) -> ThreadHandle {
+        ThreadHandle {
+            ptr: self.ptr.as_ptr(),
+        }
+    }
 }
 
 impl Drop for SpdkThread {
@@ -419,4 +517,160 @@ impl CurrentThread {
     pub fn as_ptr(&self) -> *mut spdk_thread {
         self.ptr.as_ptr()
     }
+}
+
+/// Handle to a spawned SPDK thread.
+///
+/// Returned by [`SpdkThread::spawn()`]. Use [`join()`](Self::join) to wait
+/// for the thread to complete and get its result.
+///
+/// # Example
+///
+/// ```no_run
+/// use spdk_io::SpdkThread;
+///
+/// let handle = SpdkThread::spawn("worker", |thread| {
+///     for _ in 0..10 {
+///         thread.poll();
+///     }
+///     "done"
+/// });
+///
+/// let result = handle.join().unwrap();
+/// assert_eq!(result, "done");
+/// ```
+pub struct JoinHandle<T> {
+    handle: thread::JoinHandle<T>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Wait for the thread to finish and return its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the thread panicked.
+    pub fn join(self) -> Result<T> {
+        self.handle.join().map_err(|_| Error::ThreadPanic)
+    }
+
+    /// Check if the thread has finished.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Get the underlying OS thread handle.
+    pub fn thread(&self) -> &thread::Thread {
+        self.handle.thread()
+    }
+}
+
+/// Thread-safe handle for sending messages to an SPDK thread.
+///
+/// Unlike [`SpdkThread`] (which is `!Send + !Sync`), this handle can be
+/// cloned and sent across OS threads. Use it to dispatch closures to
+/// execute on the target SPDK thread.
+///
+/// Internally uses `spdk_thread_send_msg()` which is thread-safe.
+///
+/// # Example
+///
+/// ```ignore
+/// let main_thread = SpdkThread::new("main")?;
+/// let main_handle = main_thread.handle();
+///
+/// SpdkThread::spawn("worker", move |worker| {
+///     // Do work on worker thread
+///     let result = 42;
+///
+///     // Send result back to main thread
+///     main_handle.send(move || {
+///         println!("Result: {}", result);
+///     });
+///
+///     for _ in 0..100 { worker.poll(); }
+/// });
+/// ```
+#[derive(Clone)]
+pub struct ThreadHandle {
+    ptr: *mut spdk_thread,
+}
+
+// SAFETY: spdk_thread_send_msg() is thread-safe
+unsafe impl Send for ThreadHandle {}
+unsafe impl Sync for ThreadHandle {}
+
+impl ThreadHandle {
+    /// Send a closure to execute on the target thread.
+    ///
+    /// Returns immediately. The closure will run when the target thread
+    /// is next polled.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = thread.handle();
+    ///
+    /// handle.send(|| {
+    ///     println!("Running on target thread!");
+    /// });
+    /// ```
+    pub fn send<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // Box the closure and convert to raw pointer
+        let boxed: Box<Box<dyn FnOnce() + Send>> = Box::new(Box::new(f));
+        let ctx = Box::into_raw(boxed) as *mut c_void;
+
+        unsafe {
+            spdk_thread_send_msg(self.ptr, Some(msg_callback), ctx);
+        }
+    }
+
+    /// Send a closure and await the result.
+    ///
+    /// This sends the closure to execute on the target thread and returns
+    /// a future that resolves when the closure completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the closure panics on the target thread.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let result = worker_handle.call(|| expensive_computation()).await;
+    /// ```
+    pub fn call<F, T>(&self, f: F) -> CompletionReceiver<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = completion::<T>();
+
+        self.send(move || {
+            let result = f();
+            tx.success(result);
+        });
+
+        rx
+    }
+
+    /// Get the target thread's ID.
+    pub fn id(&self) -> u64 {
+        unsafe { spdk_thread_get_id(self.ptr) }
+    }
+
+    /// Get the raw pointer to the target thread.
+    pub fn as_ptr(&self) -> *mut spdk_thread {
+        self.ptr
+    }
+}
+
+/// Callback for spdk_thread_send_msg
+unsafe extern "C" fn msg_callback(ctx: *mut c_void) {
+    // Reconstruct the boxed closure
+    let boxed: Box<Box<dyn FnOnce() + Send>> = unsafe { Box::from_raw(ctx as *mut _) };
+    // Call the closure
+    boxed();
 }

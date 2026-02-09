@@ -44,9 +44,17 @@ pub enum Error {
     #[error("Memory allocation failed")]
     MemoryAlloc,
 
+    /// DMA buffer allocation failed
+    #[error("DMA buffer allocation failed for {0} bytes")]
+    DmaAlloc(usize),
+
     /// Operation was cancelled
     #[error("Operation cancelled")]
     Cancelled,
+
+    /// Thread panicked
+    #[error("Thread panicked")]
+    ThreadPanic,
 
     /// OS error with errno
     #[error("OS error: {0}")]

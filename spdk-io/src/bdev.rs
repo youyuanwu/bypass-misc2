@@ -48,6 +48,8 @@ use std::ptr::NonNull;
 use spdk_io_sys::*;
 
 use crate::channel::IoChannel;
+use crate::complete::{CompletionSender, completion};
+use crate::dma::DmaBuf;
 use crate::error::{Error, Result};
 
 /// Block device handle.
@@ -222,12 +224,141 @@ impl BdevDesc {
     pub fn as_ptr(&self) -> *mut spdk_bdev_desc {
         self.ptr.as_ptr()
     }
+
+    /// Read data from the bdev.
+    ///
+    /// Reads `buf.len()` bytes from the specified byte offset into the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - I/O channel obtained from [`get_io_channel()`](Self::get_io_channel)
+    /// * `buf` - DMA buffer to read into (must be allocated via [`DmaBuf::alloc()`])
+    /// * `offset` - Byte offset to start reading from
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The read submission fails (e.g., invalid offset/length)
+    /// - The I/O operation fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use spdk_io::{Bdev, DmaBuf};
+    ///
+    /// # async fn example() -> spdk_io::Result<()> {
+    /// let bdev = Bdev::get_by_name("Null0").unwrap();
+    /// let desc = bdev.open(false)?;
+    /// let channel = desc.get_io_channel()?;
+    ///
+    /// let mut buf = DmaBuf::alloc(4096, 512)?;
+    /// desc.read(&channel, &mut buf, 0).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read(&self, channel: &IoChannel, buf: &mut DmaBuf, offset: u64) -> Result<()> {
+        let (tx, rx) = completion::<()>();
+
+        let rc = unsafe {
+            spdk_bdev_read(
+                self.ptr.as_ptr(),
+                channel.as_ptr(),
+                buf.as_mut_ptr() as *mut c_void,
+                offset,
+                buf.len() as u64,
+                Some(bdev_io_completion_cb),
+                tx.into_raw(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(Error::Os(rc));
+        }
+
+        rx.await
+    }
+
+    /// Write data to the bdev.
+    ///
+    /// Writes `buf.len()` bytes from the buffer to the specified byte offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - I/O channel obtained from [`get_io_channel()`](Self::get_io_channel)
+    /// * `buf` - DMA buffer containing data to write
+    /// * `offset` - Byte offset to start writing at
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The bdev was opened read-only
+    /// - The write submission fails (e.g., invalid offset/length)
+    /// - The I/O operation fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use spdk_io::{Bdev, DmaBuf};
+    ///
+    /// # async fn example() -> spdk_io::Result<()> {
+    /// let bdev = Bdev::get_by_name("Null0").unwrap();
+    /// let desc = bdev.open(true)?;  // Open for write
+    /// let channel = desc.get_io_channel()?;
+    ///
+    /// let mut buf = DmaBuf::alloc_zeroed(4096, 512)?;
+    /// buf.as_mut_slice()[..5].copy_from_slice(b"hello");
+    /// desc.write(&channel, &buf, 0).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn write(&self, channel: &IoChannel, buf: &DmaBuf, offset: u64) -> Result<()> {
+        let (tx, rx) = completion::<()>();
+
+        let rc = unsafe {
+            spdk_bdev_write(
+                self.ptr.as_ptr(),
+                channel.as_ptr(),
+                buf.as_ptr() as *mut c_void,
+                offset,
+                buf.len() as u64,
+                Some(bdev_io_completion_cb),
+                tx.into_raw(),
+            )
+        };
+
+        if rc != 0 {
+            return Err(Error::Os(rc));
+        }
+
+        rx.await
+    }
 }
 
 impl Drop for BdevDesc {
     fn drop(&mut self) {
         // Must be called on the same thread as open
         unsafe { spdk_bdev_close(self.ptr.as_ptr()) };
+    }
+}
+
+/// Bdev I/O completion callback.
+///
+/// Called by SPDK when a read/write operation completes.
+/// Frees the bdev_io and signals the completion.
+unsafe extern "C" fn bdev_io_completion_cb(
+    bdev_io: *mut spdk_bdev_io,
+    success: bool,
+    cb_arg: *mut c_void,
+) {
+    // SAFETY: bdev_io is valid and must be freed after use
+    unsafe { spdk_bdev_free_io(bdev_io) };
+
+    // SAFETY: cb_arg was created by CompletionSender::into_raw()
+    let tx = unsafe { CompletionSender::<()>::from_raw(cb_arg) };
+    if success {
+        tx.success(());
+    } else {
+        tx.error(Error::IoError);
     }
 }
 

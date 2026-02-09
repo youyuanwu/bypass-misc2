@@ -30,9 +30,11 @@
 //! ```
 
 use std::ffi::{CString, c_void};
+use std::future::Future;
 
 use spdk_io_sys::*;
 
+use crate::complete::block_on;
 use crate::env::LogLevel;
 use crate::error::{Error, Result};
 
@@ -92,6 +94,8 @@ impl SpdkApp {
 pub struct SpdkAppBuilder {
     name: Option<String>,
     config_file: Option<String>,
+    json_data: Option<Vec<u8>>,
+    json_config_ignore_errors: bool,
     reactor_mask: Option<String>,
     rpc_addr: Option<String>,
     main_core: Option<i32>,
@@ -108,6 +112,8 @@ impl SpdkAppBuilder {
         Self {
             name: None,
             config_file: None,
+            json_data: None,
+            json_config_ignore_errors: false,
             reactor_mask: None,
             rpc_addr: None,
             main_core: None,
@@ -145,6 +151,46 @@ impl SpdkAppBuilder {
     /// ```
     pub fn config_file(mut self, path: &str) -> Self {
         self.config_file = Some(path.to_string());
+        self
+    }
+
+    /// Set JSON configuration data directly (instead of a file).
+    ///
+    /// This is an alternative to [`config_file`](Self::config_file). The JSON
+    /// string is passed directly to SPDK without writing to a file.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use spdk_io::SpdkApp;
+    ///
+    /// let config = r#"{
+    ///     "subsystems": [{
+    ///         "subsystem": "bdev",
+    ///         "config": [{
+    ///             "method": "bdev_null_create",
+    ///             "params": {"name": "Null0", "num_blocks": 1024, "block_size": 512}
+    ///         }]
+    ///     }]
+    /// }"#;
+    ///
+    /// SpdkApp::builder()
+    ///     .name("my_app")
+    ///     .json_data(config)
+    ///     .run(|| { /* ... */ SpdkApp::stop(); })
+    ///     .unwrap();
+    /// ```
+    pub fn json_data(mut self, json: &str) -> Self {
+        self.json_data = Some(json.as_bytes().to_vec());
+        self
+    }
+
+    /// Ignore errors in JSON configuration.
+    ///
+    /// If set to true, SPDK will continue initialization even if some
+    /// JSON config entries fail to apply.
+    pub fn json_config_ignore_errors(mut self, ignore: bool) -> Self {
+        self.json_config_ignore_errors = ignore;
         self
     }
 
@@ -255,6 +301,11 @@ impl SpdkAppBuilder {
             if let Some(ref config_file) = config_file_cstr {
                 opts.json_config_file = config_file.as_ptr();
             }
+            if let Some(ref json) = self.json_data {
+                opts.json_data = json.as_ptr() as *mut c_void;
+                opts.json_data_size = json.len();
+            }
+            opts.json_config_ignore_errors = self.json_config_ignore_errors;
             if let Some(ref reactor_mask) = reactor_mask_cstr {
                 opts.reactor_mask = reactor_mask.as_ptr();
             }
@@ -292,6 +343,49 @@ impl SpdkAppBuilder {
         } else {
             Ok(())
         }
+    }
+
+    /// Run the SPDK application with an async future.
+    ///
+    /// This is a convenience wrapper that runs a future to completion
+    /// using [`block_on`](crate::block_on). For more complex scenarios
+    /// (multiple concurrent tasks), use [`run`](Self::run) with a local
+    /// executor and [`spdk_poller`](crate::spdk_poller).
+    ///
+    /// The future runs on the main SPDK reactor thread after all
+    /// subsystems are initialized and JSON config is loaded.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use spdk_io::{Bdev, DmaBuf, SpdkApp};
+    ///
+    /// async fn app_main() {
+    ///     let bdev = Bdev::get_by_name("Null0").unwrap();
+    ///     let desc = bdev.open(true).unwrap();
+    ///     let channel = desc.get_io_channel().unwrap();
+    ///
+    ///     let mut buf = DmaBuf::alloc(512, 512).unwrap();
+    ///     desc.read(&channel, &mut buf, 0).await.unwrap();
+    ///
+    ///     println!("Read completed!");
+    /// }
+    ///
+    /// SpdkApp::builder()
+    ///     .name("my_app")
+    ///     .json_data(r#"{"subsystems": [...]}"#)
+    ///     .run_async(app_main)
+    ///     .expect("SPDK app failed");
+    /// ```
+    pub fn run_async<F, Fut>(self, f: F) -> Result<()>
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        self.run(move || {
+            block_on(f());
+            SpdkApp::stop();
+        })
     }
 }
 

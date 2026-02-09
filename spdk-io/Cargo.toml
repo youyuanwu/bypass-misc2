@@ -10,3 +10,7 @@ license.workspace = true
 [dependencies]
 spdk-io-sys = { path = "../spdk-io-sys" }
 thiserror = "1"
+futures-channel = "0.3"
+
+[dev-dependencies]
+futures-task = "0.3"
