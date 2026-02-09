@@ -23,6 +23,7 @@ fn main() {
         "spdk_blob",
         "spdk_blob_bdev",
         "spdk_nvme",
+        "spdk_nvmf", // NVMe-oF target
         "spdk_log",
         "spdk_util",
         "spdk_json",
@@ -30,6 +31,7 @@ fn main() {
         "spdk_jsonrpc",
         "spdk_event",
         "spdk_event_bdev", // Register bdev subsystem with event framework
+        "spdk_event_nvmf", // Register nvmf subsystem with event framework
         "spdk_bdev_malloc",
         "spdk_bdev_null",
         "spdk_accel",      // Accel framework + software module
@@ -64,8 +66,10 @@ fn main() {
     // constructor functions. These need --whole-archive or the linker will discard them.
     // Bdev modules also use SPDK_BDEV_MODULE_REGISTER() with constructors.
     // Accel modules use SPDK_ACCEL_MODULE_REGISTER() with constructors.
+    // NVMe transports use SPDK_NVME_TRANSPORT_REGISTER() with constructors.
     let parser = PkgConfigParser::new().force_whole_archive([
         "spdk_event_bdev",
+        "spdk_event_nvmf",
         "spdk_event_accel",
         "spdk_event_vmd",
         "spdk_event_sock",
@@ -75,6 +79,8 @@ fn main() {
         "spdk_bdev_malloc",
         "spdk_accel",      // Contains software accel module (accel_sw)
         "spdk_sock_posix", // POSIX socket implementation
+        "spdk_nvmf",       // NVMf target with transport registrations
+        "spdk_nvme",       // NVMe initiator with transport registrations (TCP, RDMA, etc.)
     ]);
 
     parser
@@ -125,6 +131,16 @@ fn main() {
         .opaque_type("spdk_nvmf_fabric_prop_get_rsp")
         .opaque_type("spdk_nvme_tcp_cmd")
         .opaque_type("spdk_nvme_tcp_rsp")
+        .opaque_type("spdk_nvmf_transport_opts")
+        .opaque_type("spdk_nvme_cdata_oncs")
+        // NVMf opaque types
+        .opaque_type("spdk_nvmf_tgt")
+        .opaque_type("spdk_nvmf_transport")
+        .opaque_type("spdk_nvmf_subsystem")
+        .opaque_type("spdk_nvmf_poll_group")
+        .opaque_type("spdk_nvmf_qpair")
+        .opaque_type("spdk_nvmf_ctrlr")
+        .opaque_type("spdk_nvmf_ns")
         // Layout tests can fail on different systems
         .layout_tests(false)
         .generate()

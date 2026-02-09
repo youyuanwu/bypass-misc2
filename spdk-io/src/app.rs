@@ -397,6 +397,9 @@ impl Default for SpdkAppBuilder {
 
 /// C callback that invokes the Rust closure
 extern "C" fn start_callback(ctx: *mut c_void) {
+    // spdk_app_start has initialized the thread library, mark it so
+    crate::thread::assume_thread_lib_initialized();
+
     // Reconstruct the wrapper and call the closure
     let wrapper: Box<CallbackWrapper> = unsafe { Box::from_raw(ctx as *mut CallbackWrapper) };
     (wrapper.func)();

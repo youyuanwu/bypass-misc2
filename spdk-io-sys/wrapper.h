@@ -19,6 +19,10 @@
 #include <spdk/nvme.h>
 #include <spdk/nvme_spec.h>
 
+/* NVMe-oF target */
+#include <spdk/nvmf.h>
+#include <spdk/nvmf_transport.h>
+
 /* Utilities */
 #include <spdk/log.h>
 #include <spdk/string.h>

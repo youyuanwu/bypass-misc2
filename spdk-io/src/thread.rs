@@ -60,17 +60,7 @@ pub const SMALL_MSG_MEMPOOL_SIZE: usize = 1023;
 /// Initialize the SPDK thread library with custom mempool size.
 ///
 /// This is called automatically when creating the first [`SpdkThread`].
-/// Can also be called explicitly for custom initialization.
-///
-/// # Arguments
-///
-/// * `msg_mempool_size` - Size of the message mempool. Use [`SMALL_MSG_MEMPOOL_SIZE`]
-///   for testing without hugepages, or [`DEFAULT_MSG_MEMPOOL_SIZE`] for production.
-///
-/// # Errors
-///
-/// Returns an error if initialization fails.
-pub fn thread_lib_init_ext(msg_mempool_size: usize) -> Result<()> {
+pub(crate) fn thread_lib_init_ext(msg_mempool_size: usize) -> Result<()> {
     if THREAD_LIB_INITIALIZED.swap(true, Ordering::SeqCst) {
         return Ok(()); // Already initialized
     }
@@ -87,11 +77,8 @@ pub fn thread_lib_init_ext(msg_mempool_size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Initialize the SPDK thread library with default settings (simple version).
-///
-/// This uses `spdk_thread_lib_init` which doesn't require a custom mempool size.
-/// It's simpler and works better with the standard SPDK setup.
-pub fn thread_lib_init() -> Result<()> {
+/// Initialize the SPDK thread library with default settings.
+pub(crate) fn thread_lib_init() -> Result<()> {
     if THREAD_LIB_INITIALIZED.swap(true, Ordering::SeqCst) {
         return Ok(()); // Already initialized
     }
@@ -109,11 +96,15 @@ pub fn thread_lib_init() -> Result<()> {
     Ok(())
 }
 
-/// Finalize the SPDK thread library.
+/// Mark the thread library as initialized without calling init.
 ///
-/// Called automatically when the last thread is destroyed.
-/// All threads must be destroyed before calling this.
-fn thread_lib_fini() {
+/// Used when the thread library was initialized externally (e.g., by `spdk_app_start()`).
+pub(crate) fn assume_thread_lib_initialized() {
+    THREAD_LIB_INITIALIZED.store(true, Ordering::SeqCst);
+}
+
+/// Finalize the SPDK thread library.
+pub(crate) fn thread_lib_fini() {
     if THREAD_LIB_INITIALIZED.swap(false, Ordering::SeqCst) {
         unsafe {
             spdk_thread_lib_fini();
@@ -172,9 +163,21 @@ impl SpdkThread {
     /// }
     /// ```
     pub fn current(name: &str) -> Result<Self> {
-        // Use simple init (no custom mempool size)
+        // Initialize thread library if not already done
         thread_lib_init()?;
+        Self::attach(name)
+    }
 
+    /// Attach an SPDK thread context to the current OS thread.
+    ///
+    /// Unlike [`current()`](Self::current), this does NOT initialize the
+    /// thread library. Use this when the library was already initialized
+    /// (e.g., by `SpdkApp` or explicit [`thread_lib_init()`] call).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if thread creation fails.
+    pub fn attach(name: &str) -> Result<Self> {
         let name_cstr = CString::new(name)?;
 
         let ptr = unsafe { spdk_thread_create(name_cstr.as_ptr(), std::ptr::null()) };
@@ -377,26 +380,6 @@ impl SpdkThread {
     /// let result = handle.join().unwrap();
     /// assert_eq!(result, 42);
     /// ```
-    ///
-    /// # With async executor
-    ///
-    /// ```ignore
-    /// use spdk_io::{SpdkThread, spdk_poller, Bdev};
-    /// use async_executor::LocalExecutor;
-    ///
-    /// let handle = SpdkThread::spawn("io-worker", |_thread| {
-    ///     let ex = LocalExecutor::new();
-    ///     futures_lite::future::block_on(ex.run(async {
-    ///         ex.spawn(spdk_poller()).detach();
-    ///         
-    ///         // Do async I/O work
-    ///         let bdev = Bdev::get_by_name("Null0").unwrap();
-    ///         // ...
-    ///     }));
-    /// });
-    ///
-    /// handle.join().unwrap();
-    /// ```
     pub fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
     where
         F: FnOnce(&SpdkThread) -> T + Send + 'static,
@@ -408,8 +391,12 @@ impl SpdkThread {
             .name(name_owned.clone())
             .spawn(move || {
                 // Create SPDK thread on this new OS thread
-                let spdk_thread = SpdkThread::current(&name_owned)
-                    .expect("Failed to create SPDK thread in spawned thread");
+                // Use attach() - assumes thread lib is already initialized
+                // (either by SpdkApp or explicit thread_lib_init call)
+                let spdk_thread = SpdkThread::attach(&name_owned).expect(
+                    "Failed to create SPDK thread in spawned thread. \
+                             Is the thread library initialized (e.g., via SpdkApp)?",
+                );
 
                 // Run the user's function (spdk_thread is dropped after f returns)
                 f(&spdk_thread)
@@ -423,18 +410,6 @@ impl SpdkThread {
     ///
     /// The returned [`ThreadHandle`] can be cloned and sent to other threads.
     /// Use it to dispatch work to this thread via [`ThreadHandle::send()`].
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let main_thread = SpdkThread::new("main")?;
-    /// let handle = main_thread.handle();
-    ///
-    /// // Send handle to another thread
-    /// SpdkThread::spawn("worker", move |_| {
-    ///     handle.send(|| println!("Hello from main thread!"));
-    /// });
-    /// ```
     pub fn handle(&self) -> ThreadHandle {
         ThreadHandle {
             ptr: self.ptr.as_ptr(),
@@ -571,25 +546,6 @@ impl<T> JoinHandle<T> {
 /// execute on the target SPDK thread.
 ///
 /// Internally uses `spdk_thread_send_msg()` which is thread-safe.
-///
-/// # Example
-///
-/// ```ignore
-/// let main_thread = SpdkThread::new("main")?;
-/// let main_handle = main_thread.handle();
-///
-/// SpdkThread::spawn("worker", move |worker| {
-///     // Do work on worker thread
-///     let result = 42;
-///
-///     // Send result back to main thread
-///     main_handle.send(move || {
-///         println!("Result: {}", result);
-///     });
-///
-///     for _ in 0..100 { worker.poll(); }
-/// });
-/// ```
 #[derive(Clone)]
 pub struct ThreadHandle {
     ptr: *mut spdk_thread,
@@ -604,16 +560,6 @@ impl ThreadHandle {
     ///
     /// Returns immediately. The closure will run when the target thread
     /// is next polled.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = thread.handle();
-    ///
-    /// handle.send(|| {
-    ///     println!("Running on target thread!");
-    /// });
-    /// ```
     pub fn send<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -635,12 +581,6 @@ impl ThreadHandle {
     /// # Panics
     ///
     /// Panics if the closure panics on the target thread.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let result = worker_handle.call(|| expensive_computation()).await;
-    /// ```
     pub fn call<F, T>(&self, f: F) -> CompletionReceiver<T>
     where
         F: FnOnce() -> T + Send + 'static,

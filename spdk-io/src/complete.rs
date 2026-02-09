@@ -5,35 +5,12 @@
 //!
 //! # Pattern
 //!
-//! 1. Create a [`Completion`] which gives you a sender and receiver
+//! 1. Create a completion pair with [`completion()`]
 //! 2. Convert sender to raw pointer via [`CompletionSender::into_raw()`]
 //! 3. Pass raw pointer as callback context to SPDK
 //! 4. In callback, reconstruct sender via [`CompletionSender::from_raw()`]
 //! 5. Send the result
 //! 6. Await the receiver
-//!
-//! # Example
-//!
-//! ```ignore
-//! use spdk_io::complete::Completion;
-//!
-//! // Create completion pair
-//! let (tx, rx) = Completion::<()>::new();
-//!
-//! // Pass to C callback
-//! let ctx = tx.into_raw();
-//! unsafe { some_spdk_async_op(callback, ctx) };
-//!
-//! // Await result
-//! let result = rx.await?;
-//!
-//! // In C callback:
-//! extern "C" fn callback(ctx: *mut c_void, success: bool) {
-//!     let tx = unsafe { CompletionSender::<()>::from_raw(ctx) };
-//!     let result = if success { Ok(()) } else { Err(Error::IoError) };
-//!     tx.complete(result);
-//! }
-//! ```
 
 use std::ffi::c_void;
 use std::future::Future;
@@ -113,15 +90,6 @@ impl<T> Future for CompletionReceiver<T> {
 }
 
 /// Create a completion sender/receiver pair.
-///
-/// # Example
-///
-/// ```ignore
-/// let (tx, rx) = completion::<()>();
-/// let ctx = tx.into_raw();
-/// // ... submit async operation with ctx ...
-/// let result = rx.await?;
-/// ```
 pub fn completion<T>() -> (CompletionSender<T>, CompletionReceiver<T>) {
     let (tx, rx) = oneshot::channel();
     (CompletionSender { tx }, CompletionReceiver { rx })

@@ -24,31 +24,8 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Example
-//!
-//! ```ignore
-//! use spdk_io::{SpdkApp, poller::spdk_poller};
-//! use async_executor::LocalExecutor;
-//! use futures_lite::future;
-//!
-//! SpdkApp::builder()
-//!     .name("app")
-//!     .json_data(config)
-//!     .run(|| {
-//!         let ex = LocalExecutor::new();
-//!         future::block_on(ex.run(async {
-//!             // Spawn SPDK poller as a background task
-//!             ex.spawn(spdk_poller()).detach();
-//!             
-//!             // Now multiple concurrent I/Os work
-//!             let (r1, r2) = futures::join!(
-//!                 do_read(&desc, &channel, 0),
-//!                 do_read(&desc, &channel, 4096),
-//!             );
-//!         }));
-//!         SpdkApp::stop();
-//!     });
-//! ```
+//! Use [`spdk_poller()`] as a background task in your executor to drive
+//! SPDK I/O completions.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -94,21 +71,6 @@ fn yield_now() -> YieldNow {
 /// # Panics
 ///
 /// Panics if called from outside an SPDK thread context.
-///
-/// # Example
-///
-/// ```ignore
-/// use async_executor::LocalExecutor;
-/// use spdk_io::poller::spdk_poller;
-///
-/// let ex = LocalExecutor::new();
-/// futures_lite::future::block_on(ex.run(async {
-///     ex.spawn(spdk_poller()).detach();
-///     
-///     // Your async I/O code here
-///     desc.read(&channel, &mut buf, 0).await?;
-/// }));
-/// ```
 pub async fn spdk_poller() {
     let thread = SpdkThread::get_current().expect("spdk_poller called outside SPDK thread context");
 

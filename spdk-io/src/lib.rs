@@ -30,6 +30,8 @@
 //! - [`thread`] - SPDK thread management
 //! - [`channel`] - I/O channel management
 //! - [`error`] - Error types
+//! - [`nvme`] - Direct NVMe driver access
+//! - [`nvmf`] - NVMe-oF target for in-process testing
 
 pub mod app;
 pub mod bdev;
@@ -38,6 +40,8 @@ pub mod complete;
 pub mod dma;
 pub mod env;
 pub mod error;
+pub mod nvme;
+pub mod nvmf;
 pub mod poller;
 pub mod thread;
 

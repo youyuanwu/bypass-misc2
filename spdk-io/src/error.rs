@@ -59,6 +59,27 @@ pub enum Error {
     /// OS error with errno
     #[error("OS error: {0}")]
     Os(i32),
+
+    /// NVMe command error
+    #[error("NVMe error: SCT={sct}, SC={sc}")]
+    NvmeError {
+        /// Status Code Type
+        sct: u8,
+        /// Status Code
+        sc: u8,
+    },
+
+    /// NVMe controller not found
+    #[error("NVMe controller not found")]
+    ControllerNotFound,
+
+    /// NVMe namespace not found
+    #[error("NVMe namespace not found: {0}")]
+    NamespaceNotFound(u32),
+
+    /// NVMe qpair allocation failed
+    #[error("NVMe qpair allocation failed")]
+    QpairAlloc,
 }
 
 impl Error {

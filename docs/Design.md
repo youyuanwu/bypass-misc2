@@ -37,6 +37,16 @@
 | - `IoChannel` | ✅ | Per-thread I/O channel wrapper, `!Send + !Sync` |
 | - `Error` types | ✅ | Comprehensive error enum with thiserror |
 | - Integration tests | ✅ | vdev mode (no hugepages required) |
+| **nvme module** | ✅ | Direct NVMe driver access |
+| - `TransportId` | ✅ | PCIe/TCP/RDMA connection identifiers |
+| - `NvmeController` | ✅ | Connect, namespace, alloc_io_qpair |
+| - `NvmeNamespace` | ✅ | Async read/write |
+| - `NvmeQpair` | ✅ | Per-thread I/O queue |
+| **nvmf module** | ✅ | In-process NVMe-oF target (see warning below) |
+| - `NvmfTarget` | ✅ | Create, add_transport, create_subsystem |
+| - `NvmfTransport` | ✅ | TCP/RDMA transport creation |
+| - `NvmfSubsystem` | ✅ | add_namespace, add_listener, start/stop |
+| **NVMf subprocess testing** | ✅ | Preferred approach for testing (see `tests/nvmf_test.rs`) |
 | **CI/CD** | ✅ | GitHub Actions with SPDK deb package |
 
 ### In Progress
@@ -50,7 +60,6 @@
 | Component | Notes |
 |-----------|-------|
 | `Blobstore` / `Blob` | Blobstore API |
-| `NvmeController` | Direct NVMe access |
 
 ### Build & Linking
 
@@ -97,13 +106,24 @@ spdk-io/
     │   ├── error.rs      # Error types
     │   ├── poller.rs     # SPDK poller task for executor integration
     │   ├── thread.rs     # SPDK thread management
-    │   ├── blob.rs       # Blobstore API [planned]
-    │   └── nvme.rs       # NVMe driver API [planned]
+    │   ├── nvme/         # NVMe driver API
+    │   │   ├── mod.rs
+    │   │   ├── controller.rs
+    │   │   ├── namespace.rs
+    │   │   ├── qpair.rs
+    │   │   └── transport.rs
+    │   └── nvmf/         # NVMf target API
+    │       ├── mod.rs
+    │       ├── target.rs
+    │       ├── subsystem.rs
+    │       ├── transport.rs
+    │       └── opts.rs
     ├── tests/
     │   ├── app_test.rs   # SpdkApp simple test
     │   ├── bdev_test.rs  # Bdev/BdevDesc with null bdev
     │   ├── env_init.rs   # SpdkEnv initialization test
     │   ├── mempool_test.rs
+    │   ├── nvmf_test.rs  # NVMf subprocess integration test
     │   └── thread_test.rs
     └── Cargo.toml
 ```
@@ -683,9 +703,9 @@ impl SpdkAppBuilder {
 pub const DEFAULT_MSG_MEMPOOL_SIZE: usize = 262144 - 1;  // Production
 pub const SMALL_MSG_MEMPOOL_SIZE: usize = 1023;          // Testing (no hugepages)
 
-/// Initialize thread library (called automatically by SpdkThread::new)
-pub fn thread_lib_init() -> Result<()>;
-pub fn thread_lib_init_ext(msg_mempool_size: usize) -> Result<()>;
+// Note: thread_lib_init(), thread_lib_init_ext(), assume_thread_lib_initialized()
+// are internal (pub(crate)). SpdkThread::current() and SpdkApp handle initialization
+// automatically.
 
 /// SPDK thread context - !Send + !Sync, must stay on creating OS thread.
 /// This is a lightweight scheduling context, NOT an OS thread.
@@ -756,7 +776,7 @@ impl CurrentThread {
 }
 ```
 
-### Cross-Thread Messaging (Planned)
+### Cross-Thread Messaging
 
 SPDK provides `spdk_thread_send_msg()` for sending callbacks between threads.
 This is essential for multi-core scenarios where work needs to be dispatched
@@ -1007,6 +1027,706 @@ pub struct Blob {
 
 /// Blob identifier.
 pub struct BlobId(spdk_blob_id);
+```
+
+### NVMe API
+
+Direct NVMe access bypassing the bdev layer. Use this for:
+- Custom admin commands
+- Namespace management
+- Maximum performance (bypasses bdev abstraction)
+- E2E tests with real NVMe devices
+
+#### Core Types
+
+```rust
+/// NVMe transport identifier.
+/// 
+/// Identifies how to connect to an NVMe controller (PCIe, TCP, RDMA, etc.)
+#[derive(Debug, Clone)]
+pub struct TransportId {
+    inner: spdk_nvme_transport_id,
+}
+
+impl TransportId {
+    /// Create a PCIe transport ID from BDF address.
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// use spdk_io::nvme::TransportId;
+    /// 
+    /// // Connect to NVMe at PCI address 0000:00:04.0
+    /// let trid = TransportId::pcie("0000:00:04.0")?;
+    /// ```
+    pub fn pcie(addr: &str) -> Result<Self>;
+    
+    /// Create a TCP transport ID.
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// let trid = TransportId::tcp("192.168.1.100", "4420", "nqn.2024-01.io.spdk:cnode1")?;
+    /// ```
+    pub fn tcp(addr: &str, port: &str, subnqn: &str) -> Result<Self>;
+    
+    /// Create a RDMA transport ID.
+    pub fn rdma(addr: &str, port: &str, subnqn: &str) -> Result<Self>;
+    
+    /// Parse from string (SPDK format).
+    /// 
+    /// Format: `trtype:PCIe traddr:0000:00:04.0`
+    pub fn parse(s: &str) -> Result<Self>;
+}
+```
+
+```rust
+/// NVMe controller handle.
+/// 
+/// Represents a connected NVMe controller. Obtained via [`connect()`](Self::connect)
+/// or [`probe()`](Self::probe).
+/// 
+/// # Thread Safety
+/// 
+/// `!Send + !Sync` - controller operations must remain on the thread that connected.
+/// 
+/// # Example
+/// 
+/// ```no_run
+/// use spdk_io::{SpdkApp, nvme::{NvmeController, TransportId}};
+/// 
+/// SpdkApp::builder()
+///     .name("nvme_test")
+///     .run(|| {
+///         let trid = TransportId::pcie("0000:00:04.0").unwrap();
+///         let ctrlr = NvmeController::connect(&trid, None).unwrap();
+///         
+///         println!("Controller: {} namespaces", ctrlr.num_namespaces());
+///         
+///         let ns = ctrlr.namespace(1).unwrap();
+///         println!("NS1: {} sectors, {} bytes/sector", 
+///                  ns.num_sectors(), ns.sector_size());
+///         
+///         SpdkApp::stop();
+///     })
+///     .unwrap();
+/// ```
+pub struct NvmeController {
+    ptr: NonNull<spdk_nvme_ctrlr>,
+    _marker: PhantomData<*mut ()>, // !Send + !Sync
+}
+
+impl NvmeController {
+    /// Connect to an NVMe controller.
+    /// 
+    /// This is the synchronous connect API. For multiple controllers,
+    /// prefer [`probe()`](Self::probe) which can discover and attach
+    /// to multiple controllers efficiently.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `trid` - Transport identifier (PCIe, TCP, RDMA)
+    /// * `opts` - Optional controller options (queue depth, etc.)
+    /// 
+    /// # Errors
+    /// 
+    /// Returns error if connection fails (device not found, permission denied, etc.)
+    pub fn connect(trid: &TransportId, opts: Option<&NvmeCtrlrOpts>) -> Result<Self>;
+    
+    /// Connect to an NVMe controller asynchronously.
+    /// 
+    /// Returns a future that completes when connection is established.
+    pub async fn connect_async(trid: &TransportId, opts: Option<&NvmeCtrlrOpts>) -> Result<Self>;
+    
+    /// Probe for NVMe controllers matching the transport ID.
+    /// 
+    /// This scans for controllers and calls the callback for each one found.
+    /// More efficient than multiple [`connect()`](Self::connect) calls.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `trid` - Transport ID filter (None = probe all)
+    /// * `probe_cb` - Called for each controller found; return true to attach
+    /// * `attach_cb` - Called when controller is attached
+    pub fn probe<F, G>(trid: Option<&TransportId>, probe_cb: F, attach_cb: G) -> Result<()>
+    where
+        F: FnMut(&TransportId, &NvmeCtrlrOpts) -> bool,
+        G: FnMut(&TransportId, NvmeController);
+    
+    /// Get the number of namespaces.
+    /// 
+    /// Note: Some namespace IDs may be inactive.
+    pub fn num_namespaces(&self) -> u32;
+    
+    /// Get a namespace by ID (1-indexed).
+    /// 
+    /// Returns `None` if the namespace ID is invalid or inactive.
+    pub fn namespace(&self, ns_id: u32) -> Option<NvmeNamespace>;
+    
+    /// Allocate an I/O queue pair for submitting commands.
+    /// 
+    /// Each thread should have its own qpair for lock-free I/O.
+    pub fn alloc_io_qpair(&self, opts: Option<&NvmeQpairOpts>) -> Result<NvmeQpair>;
+    
+    /// Process admin command completions.
+    /// 
+    /// Call periodically to process admin command responses and keep-alive.
+    pub fn process_admin_completions(&self) -> i32;
+    
+    /// Get controller data (identify controller).
+    pub fn data(&self) -> &spdk_nvme_ctrlr_data;
+    
+    /// Get transport ID used to connect.
+    pub fn transport_id(&self) -> TransportId;
+}
+
+impl Drop for NvmeController {
+    fn drop(&mut self) {
+        // Detach from controller
+        unsafe { spdk_nvme_detach(self.ptr.as_ptr()) };
+    }
+}
+```
+
+```rust
+/// NVMe namespace handle.
+/// 
+/// Represents a namespace on a controller. Obtained via 
+/// [`NvmeController::namespace()`].
+/// 
+/// # Lifetime
+/// 
+/// The namespace is borrowed from the controller and becomes invalid
+/// when the controller is dropped.
+pub struct NvmeNamespace<'a> {
+    ptr: NonNull<spdk_nvme_ns>,
+    ctrlr: &'a NvmeController,
+}
+
+impl<'a> NvmeNamespace<'a> {
+    /// Get namespace ID.
+    pub fn id(&self) -> u32;
+    
+    /// Get sector size in bytes.
+    pub fn sector_size(&self) -> u32;
+    
+    /// Get total number of sectors.
+    pub fn num_sectors(&self) -> u64;
+    
+    /// Get total size in bytes.
+    pub fn size(&self) -> u64;
+    
+    /// Get maximum I/O transfer size in bytes.
+    pub fn max_io_xfer_size(&self) -> u32;
+    
+    /// Check if namespace is active.
+    pub fn is_active(&self) -> bool;
+    
+    /// Submit a read command.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `qpair` - Queue pair for submission
+    /// * `buf` - DMA buffer to read into
+    /// * `lba` - Starting logical block address
+    /// * `num_blocks` - Number of blocks to read
+    /// 
+    /// # Example
+    /// 
+    /// ```no_run
+    /// let ns = ctrlr.namespace(1).unwrap();
+    /// let qpair = ctrlr.alloc_io_qpair(None).unwrap();
+    /// let mut buf = DmaBuf::alloc(4096, 4096)?;
+    /// 
+    /// // Read block 0
+    /// ns.read(&qpair, &mut buf, 0, 1).await?;
+    /// ```
+    pub async fn read(&self, qpair: &NvmeQpair, buf: &mut DmaBuf, lba: u64, num_blocks: u32) -> Result<()>;
+    
+    /// Submit a write command.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `qpair` - Queue pair for submission
+    /// * `buf` - DMA buffer with data to write
+    /// * `lba` - Starting logical block address
+    /// * `num_blocks` - Number of blocks to write
+    pub async fn write(&self, qpair: &NvmeQpair, buf: &DmaBuf, lba: u64, num_blocks: u32) -> Result<()>;
+    
+    /// Submit a flush command.
+    pub async fn flush(&self, qpair: &NvmeQpair) -> Result<()>;
+}
+```
+
+```rust
+/// NVMe I/O queue pair.
+/// 
+/// Used to submit I/O commands to a namespace. Each thread should
+/// have its own qpair for lock-free operation.
+/// 
+/// # Thread Safety
+/// 
+/// `!Send + !Sync` - qpair must stay on the allocating thread.
+pub struct NvmeQpair {
+    ptr: NonNull<spdk_nvme_qpair>,
+    ctrlr_ptr: *mut spdk_nvme_ctrlr, // For freeing
+    _marker: PhantomData<*mut ()>,
+}
+
+impl NvmeQpair {
+    /// Process I/O completions.
+    /// 
+    /// Call this to check for completed I/O operations. Returns the
+    /// number of completions processed.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `max_completions` - Max completions to process (0 = unlimited)
+    pub fn process_completions(&self, max_completions: u32) -> i32;
+}
+
+impl Drop for NvmeQpair {
+    fn drop(&mut self) {
+        unsafe { spdk_nvme_ctrlr_free_io_qpair(self.ptr.as_ptr()) };
+    }
+}
+```
+
+```rust
+/// NVMe controller options.
+#[derive(Debug, Default, Clone)]
+pub struct NvmeCtrlrOpts {
+    /// Number of I/O queues to request
+    pub num_io_queues: Option<u32>,
+    /// I/O queue depth
+    pub io_queue_size: Option<u32>,
+    /// Admin queue depth  
+    pub admin_queue_size: Option<u16>,
+    /// Keep-alive timeout in ms (0 = disabled)
+    pub keep_alive_timeout_ms: Option<u32>,
+}
+
+/// NVMe queue pair options.
+#[derive(Debug, Default, Clone)]
+pub struct NvmeQpairOpts {
+    /// Queue depth
+    pub io_queue_size: Option<u32>,
+    /// Queue requests
+    pub io_queue_requests: Option<u32>,
+}
+```
+
+#### Async I/O Implementation
+
+The async read/write methods use the same completion pattern as bdev:
+
+```rust
+impl<'a> NvmeNamespace<'a> {
+    pub async fn read(
+        &self, 
+        qpair: &NvmeQpair, 
+        buf: &mut DmaBuf, 
+        lba: u64, 
+        num_blocks: u32
+    ) -> Result<()> {
+        let (tx, rx) = completion();
+        
+        let rc = unsafe {
+            spdk_nvme_ns_cmd_read(
+                self.ptr.as_ptr(),
+                qpair.ptr.as_ptr(),
+                buf.as_mut_ptr() as *mut c_void,
+                lba,
+                num_blocks,
+                Some(nvme_io_complete),
+                tx.into_raw(),
+                0, // io_flags
+            )
+        };
+        
+        if rc != 0 {
+            return Err(Error::from_errno(-rc));
+        }
+        
+        rx.await
+    }
+}
+
+/// C callback for NVMe I/O completion.
+unsafe extern "C" fn nvme_io_complete(ctx: *mut c_void, cpl: *const spdk_nvme_cpl) {
+    let tx = unsafe { CompletionSender::<()>::from_raw(ctx) };
+    
+    let cpl = unsafe { &*cpl };
+    if spdk_nvme_cpl_is_success(cpl) {
+        tx.success(());
+    } else {
+        // Extract status code for error reporting
+        let sct = cpl.status.sct();
+        let sc = cpl.status.sc();
+        tx.error(Error::NvmeError { sct, sc });
+    }
+}
+```
+
+#### Error Types
+
+Additional error variant for NVMe-specific errors:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    // ... existing variants ...
+    
+    #[error("NVMe error: SCT={sct}, SC={sc}")]
+    NvmeError { sct: u8, sc: u8 },
+    
+    #[error("NVMe controller not found")]
+    ControllerNotFound,
+    
+    #[error("NVMe namespace not found: {0}")]
+    NamespaceNotFound(u32),
+    
+    #[error("NVMe qpair allocation failed")]
+    QpairAlloc,
+}
+```
+
+#### E2E Test Example
+
+```rust
+//! tests/e2e/nvme_test.rs
+use spdk_io::{SpdkApp, DmaBuf, nvme::{NvmeController, TransportId}};
+
+#[test]
+fn test_nvme_read_write() {
+    // NVMe PCI address from test environment (bound to vfio-pci)
+    let pci_addr = std::env::var("NVME_PCI_ADDR")
+        .unwrap_or_else(|_| "0000:00:04.0".to_string());
+    
+    SpdkApp::builder()
+        .name("nvme_e2e_test")
+        .mem_size_mb(256)
+        .run_async(async {
+            // Connect to NVMe controller
+            let trid = TransportId::pcie(&pci_addr).unwrap();
+            let ctrlr = NvmeController::connect(&trid, None).unwrap();
+            
+            // Get namespace 1
+            let ns = ctrlr.namespace(1).expect("Namespace 1 not found");
+            let sector_size = ns.sector_size() as usize;
+            
+            // Allocate qpair and buffer
+            let qpair = ctrlr.alloc_io_qpair(None).unwrap();
+            let mut buf = DmaBuf::alloc(sector_size, sector_size).unwrap();
+            
+            // Write test pattern
+            buf.as_mut_slice().fill(0xAB);
+            ns.write(&qpair, &buf, 0, 1).await.unwrap();
+            
+            // Read back
+            buf.as_mut_slice().fill(0x00);
+            ns.read(&qpair, &mut buf, 0, 1).await.unwrap();
+            
+            // Verify
+            assert!(buf.as_slice().iter().all(|&b| b == 0xAB));
+            
+            SpdkApp::stop();
+        })
+        .unwrap();
+}
+```
+
+#### Module Structure
+
+```
+spdk-io/src/
+├── nvme/
+│   ├── mod.rs        # Module exports
+│   ├── controller.rs # NvmeController
+│   ├── namespace.rs  # NvmeNamespace
+│   ├── qpair.rs      # NvmeQpair
+│   ├── transport.rs  # TransportId
+│   └── opts.rs       # NvmeCtrlrOpts, NvmeQpairOpts
+└── lib.rs            # pub mod nvme
+```
+
+### NVMf Target API (In-Process Testing)
+
+SPDK exposes the NVMe-oF target as a library, allowing target + initiator to run
+**in the same process**. This enables NVMe driver testing without real hardware
+and without running a separate daemon.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Same Process (spdk-io test)                                │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────────┐      ┌─────────────────────────┐  │
+│  │  NVMf Target        │      │  NVMe Initiator         │  │
+│  │                     │      │                         │  │
+│  │  Null Bdev          │◄────►│  NvmeController         │  │
+│  │    ▼                │ TCP  │    ▼                    │  │
+│  │  Subsystem          │loopbk│  NvmeNamespace          │  │
+│  │    ▼                │      │    ▼                    │  │
+│  │  TCP Listener       │      │  NvmeQpair              │  │
+│  │  127.0.0.1:4420     │      │                         │  │
+│  └─────────────────────┘      └─────────────────────────┘  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Core Types
+
+```rust
+/// NVMe-oF target instance.
+/// 
+/// Creates and manages subsystems, transports, and listeners.
+pub struct NvmfTarget {
+    ptr: NonNull<spdk_nvmf_tgt>,
+    _marker: PhantomData<*mut ()>,
+}
+
+impl NvmfTarget {
+    /// Create a new NVMf target.
+    pub async fn create(name: &str) -> Result<Self>;
+    
+    /// Add a transport (TCP, RDMA, etc.)
+    pub async fn add_transport(&self, transport: NvmfTransport) -> Result<()>;
+    
+    /// Create a subsystem.
+    pub fn create_subsystem(&self, nqn: &str, opts: NvmfSubsystemOpts) -> Result<NvmfSubsystem>;
+    
+    /// Get subsystem by NQN.
+    pub fn get_subsystem(&self, nqn: &str) -> Option<NvmfSubsystem>;
+}
+
+impl Drop for NvmfTarget {
+    fn drop(&mut self) {
+        // spdk_nvmf_tgt_destroy is async - must be called properly
+    }
+}
+```
+
+```rust
+/// NVMf transport (TCP, RDMA, etc.)
+pub struct NvmfTransport {
+    ptr: NonNull<spdk_nvmf_transport>,
+}
+
+impl NvmfTransport {
+    /// Create a TCP transport.
+    pub async fn tcp(opts: Option<&NvmfTransportOpts>) -> Result<Self>;
+    
+    /// Create an RDMA transport.
+    pub async fn rdma(opts: Option<&NvmfTransportOpts>) -> Result<Self>;
+}
+
+/// Transport options.
+#[derive(Debug, Default, Clone)]
+pub struct NvmfTransportOpts {
+    pub max_io_size: Option<u32>,
+    pub io_unit_size: Option<u32>,
+    pub max_qpairs_per_ctrlr: Option<u16>,
+    pub in_capsule_data_size: Option<u32>,
+}
+```
+
+```rust
+/// NVMf subsystem.
+/// 
+/// Represents a namespace container that can be exported to initiators.
+pub struct NvmfSubsystem {
+    ptr: NonNull<spdk_nvmf_subsystem>,
+}
+
+impl NvmfSubsystem {
+    /// Add a bdev as a namespace.
+    /// 
+    /// Returns the namespace ID.
+    pub fn add_namespace(&self, bdev_name: &str) -> Result<u32>;
+    
+    /// Add a listener address.
+    pub async fn add_listener(&self, trid: &TransportId) -> Result<()>;
+    
+    /// Allow any host to connect.
+    pub fn allow_any_host(&self, allow: bool);
+    
+    /// Start the subsystem (begin accepting connections).
+    pub async fn start(&self) -> Result<()>;
+    
+    /// Stop the subsystem.
+    pub async fn stop(&self) -> Result<()>;
+    
+    /// Get the NQN.
+    pub fn nqn(&self) -> &str;
+}
+
+/// Subsystem options.
+#[derive(Debug, Default, Clone)]
+pub struct NvmfSubsystemOpts {
+    /// Serial number
+    pub serial_number: Option<String>,
+    /// Model number
+    pub model_number: Option<String>,
+    /// Allow any host
+    pub allow_any_host: bool,
+}
+```
+
+#### ⚠️ Threading Warning
+
+**In-process NVMf targets can have threading issues.** Running the NVMf target and NVMe
+initiator on the same SPDK thread can cause deadlocks. SPDK expects target and initiator
+to run on separate reactor cores.
+
+**Recommended:** Use the subprocess approach for testing (see below).
+
+#### Subprocess Testing (Recommended)
+
+For testing, spawn `nvmf_tgt` as a separate process. This avoids threading issues
+and provides better isolation. See `tests/nvmf_test.rs` for the full implementation.
+
+```rust
+//! tests/nvmf_test.rs - Subprocess approach (recommended)
+
+/// Helper to manage nvmf_tgt subprocess
+mod nvmf_subprocess {
+    pub struct NvmfTarget { /* ... */ }
+    
+    impl NvmfTarget {
+        /// Clean up stale processes from previous runs via PID file
+        pub fn cleanup_stale(port: u16);
+        
+        /// Start nvmf_tgt subprocess, configure via RPC
+        pub fn start(port: u16) -> Result<(Self, String), String>;
+    }
+}
+
+#[test]
+fn test_nvmf_subprocess() {
+    const TEST_PORT: u16 = 4421;
+    
+    // Clean up any stale processes
+    nvmf_subprocess::NvmfTarget::cleanup_stale(TEST_PORT);
+    
+    // Start nvmf_tgt as subprocess (configures bdev, transport, subsystem via RPC)
+    let (target, nqn) = nvmf_subprocess::NvmfTarget::start(TEST_PORT).unwrap();
+    
+    SpdkApp::builder()
+        .name("test")
+        .no_pci(true)
+        .no_huge(true)
+        .mem_size_mb(1024)
+        .run(|| {
+            // Connect to external nvmf_tgt
+            let trid = TransportId::tcp("127.0.0.1", &TEST_PORT.to_string(), &nqn).unwrap();
+            let ctrlr = NvmeController::connect(&trid, None).unwrap();
+            
+            // Perform I/O...
+            
+            SpdkApp::stop();
+        })
+        .unwrap();
+    
+    // target dropped here, kills subprocess
+}
+```
+
+#### In-Process Example (Use with Caution)
+
+```rust
+//! WARNING: May have threading issues. Use subprocess approach instead.
+use spdk_io::{SpdkApp, DmaBuf};
+use spdk_io::nvme::{NvmeController, TransportId};
+use spdk_io::nvmf::{NvmfTarget, NvmfTransport, NvmfSubsystemOpts};
+
+#[test]
+fn test_nvme_over_tcp_loopback() {
+    // This test works with --no-huge (vdev mode)!
+    SpdkApp::builder()
+        .name("nvmf_loopback")
+        .no_huge(true)
+        .mem_size_mb(256)
+        .json_data(r#"{
+            "subsystems": [{
+                "subsystem": "bdev",
+                "config": [{
+                    "method": "bdev_null_create",
+                    "params": {"name": "Null0", "num_blocks": 1024, "block_size": 512}
+                }]
+            }]
+        }"#)
+        .run_async(async {
+            // === Set up NVMf target ===
+            let tgt = NvmfTarget::create("test_tgt").await.unwrap();
+            
+            // Add TCP transport
+            let transport = NvmfTransport::tcp(None).await.unwrap();
+            tgt.add_transport(transport).await.unwrap();
+            
+            // Create subsystem
+            let subsys = tgt.create_subsystem(
+                "nqn.2024-01.io.spdk:test",
+                NvmfSubsystemOpts {
+                    allow_any_host: true,
+                    ..Default::default()
+                }
+            ).unwrap();
+            
+            // Add null bdev as namespace
+            subsys.add_namespace("Null0").unwrap();
+            
+            // Add TCP listener on loopback
+            let listen_trid = TransportId::tcp("127.0.0.1", "4420", "").unwrap();
+            subsys.add_listener(&listen_trid).await.unwrap();
+            
+            // Start subsystem
+            subsys.start().await.unwrap();
+            
+            // === Connect as initiator ===
+            let connect_trid = TransportId::tcp(
+                "127.0.0.1", 
+                "4420", 
+                "nqn.2024-01.io.spdk:test"
+            ).unwrap();
+            let ctrlr = NvmeController::connect(&connect_trid, None).unwrap();
+            
+            // Get namespace and qpair
+            let ns = ctrlr.namespace(1).expect("NS1 not found");
+            let qpair = ctrlr.alloc_io_qpair(None).unwrap();
+            let mut buf = DmaBuf::alloc(512, 512).unwrap();
+            
+            // Write test pattern
+            buf.as_mut_slice().fill(0xCD);
+            ns.write(&qpair, &buf, 0, 1).await.unwrap();
+            
+            // Read back and verify
+            buf.as_mut_slice().fill(0x00);
+            ns.read(&qpair, &mut buf, 0, 1).await.unwrap();
+            assert!(buf.as_slice().iter().all(|&b| b == 0xCD));
+            
+            // Cleanup (drop order matters)
+            drop(qpair);
+            drop(ctrlr);
+            subsys.stop().await.unwrap();
+            
+            SpdkApp::stop();
+        })
+        .unwrap();
+}
+```
+
+#### Module Structure
+
+```
+spdk-io/src/
+├── nvmf/
+│   ├── mod.rs        # Module exports
+│   ├── target.rs     # NvmfTarget
+│   ├── transport.rs  # NvmfTransport
+│   ├── subsystem.rs  # NvmfSubsystem
+│   └── opts.rs       # NvmfTransportOpts, NvmfSubsystemOpts
+└── lib.rs            # pub mod nvmf
 ```
 
 ### Error Handling
@@ -1337,26 +2057,23 @@ fn test_with_real_nvme() {
 
 ## Future Considerations
 
-### Phase 1: Core Functionality
-- [ ] spdk-io-sys bindings generation
-- [ ] Environment initialization
-- [ ] SPDK thread creation/management
-- [ ] Bdev open/close/read/write
-- [ ] Runtime-agnostic poller task
-- [ ] DMA buffer management
-- [ ] Callback-to-future utilities
+### Completed
+- [x] spdk-io-sys bindings generation
+- [x] Environment initialization (`SpdkEnv`, `SpdkApp`)
+- [x] SPDK thread creation/management (`SpdkThread`, `ThreadHandle`)
+- [x] Bdev open/close/read/write
+- [x] Runtime-agnostic poller task (`spdk_poller`, `block_on`)
+- [x] DMA buffer management (`DmaBuf`)
+- [x] Callback-to-future utilities (`completion`, `io_completion`)
+- [x] NVMe driver direct access (`nvme` module)
+- [x] NVMf target API (`nvmf` module)
+- [x] Cross-thread messaging (`ThreadHandle::send`, `ThreadHandle::call`)
+- [x] Thread spawning (`SpdkThread::spawn`, `JoinHandle`)
 
-### Phase 2: Extended APIs
+### Planned
 - [ ] Blobstore support
-- [ ] NVMe driver direct access
-- [ ] Multiple bdev modules (malloc, null, aio)
-- [ ] Better error context
-
-### Phase 3: Advanced Features
-- [ ] Multi-threaded coordination utilities
-- [ ] Reactor affinity helpers
-- [ ] Custom poller integration
-- [ ] Tracing/metrics
+- [ ] Better error context with spans
+- [ ] Tracing/metrics integration
 - [ ] Optional Tokio/smol convenience wrappers
 
 ## Dependencies
