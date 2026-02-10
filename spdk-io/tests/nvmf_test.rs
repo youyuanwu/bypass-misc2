@@ -118,7 +118,7 @@ mod nvmf_subprocess {
                     "-r",
                     &rpc_socket,
                     "-m",
-                    "0x2", // Core 1 (leave core 0 for test)
+                    "0x4", // Core 2 (leave cores 0 and 1 for test)
                     "-s",
                     "1024", // 1024 MB memory (need more for bdev pool)
                     "--no-pci",
@@ -307,15 +307,17 @@ mod nvmf_subprocess {
 ///
 /// This test:
 /// 1. Starts nvmf_tgt as a subprocess
-/// 2. Configures it via RPC (null bdev, TCP transport, subsystem)
+/// 2. Configures it via RPC (malloc bdev, TCP transport, subsystem)
 /// 3. Connects using our NVMe driver API
-/// 4. Performs read/write I/O
-/// 5. Verifies data integrity
+/// 4. Uses 2 cores with separate qpairs
+/// 5. Performs read/write I/O on both cores
+/// 6. Verifies data integrity
 #[test]
 fn test_nvmf_subprocess() -> Result<()> {
     use spdk_io::nvme::NvmeController;
-    use spdk_io::{DmaBuf, SpdkApp};
+    use spdk_io::{Cores, DmaBuf, SpdkApp, SpdkEvent};
     use std::process::Command;
+    use std::sync::Arc;
 
     const TEST_PORT: u16 = 4421; // Use non-standard port to avoid conflicts
 
@@ -329,85 +331,185 @@ fn test_nvmf_subprocess() -> Result<()> {
 
     eprintln!("NVMf target started, NQN: {}", nqn);
 
-    // Run test in SPDK app context
+    // Run test in SPDK app context with 2 cores
     SpdkApp::builder()
         .name("nvmf_subprocess_test")
         .no_pci(true)
         .no_huge(true)
-        .mem_size_mb(1024) // Need more memory for bdev pool
+        .mem_size_mb(1024)
+        .reactor_mask("0x3") // Cores 0 and 1
         .run(move || {
             use futures::executor::LocalPool;
             use futures::task::LocalSpawnExt;
             use std::cell::Cell;
             use std::rc::Rc;
 
-            let mut pool = LocalPool::new();
-            let spawner = pool.spawner();
+            eprintln!("Running on {} cores", Cores::count());
+            let main_core = Cores::current();
+            eprintln!("Main callback on core {}", main_core);
 
-            pool.run_until(async {
-                eprintln!("Connecting to nvmf_tgt...");
+            // Connect on core 0, share via Arc (NvmeController is Send + Sync)
+            eprintln!("Connecting to nvmf_tgt...");
+            let trid = TransportId::tcp("127.0.0.1", &TEST_PORT.to_string(), &nqn)
+                .expect("Failed to create TransportId");
 
-                let trid = TransportId::tcp("127.0.0.1", &TEST_PORT.to_string(), &nqn)
-                    .expect("Failed to create TransportId");
+            let ctrlr = Arc::new(
+                NvmeController::connect(&trid, None).expect("Failed to connect to nvmf_tgt"),
+            );
 
-                let ctrlr =
-                    NvmeController::connect(&trid, None).expect("Failed to connect to nvmf_tgt");
+            eprintln!("Connected! {} namespaces", ctrlr.num_namespaces());
 
-                eprintln!("Connected! {} namespaces", ctrlr.num_namespaces());
-
+            let sector_size = {
                 let ns = ctrlr.namespace(1).expect("No namespace 1");
                 eprintln!(
                     "NS1: {} sectors x {} bytes",
                     ns.num_sectors(),
                     ns.sector_size()
                 );
+                ns.sector_size() as usize
+            };
 
-                let qpair = Rc::new(ctrlr.alloc_io_qpair(None).expect("Failed to alloc qpair"));
-                let sector_size = ns.sector_size() as usize;
+            // Find other core
+            let other_core = Cores::iter()
+                .find(|&c| c != main_core)
+                .expect("Expected 2 cores available");
+            eprintln!("Dispatching I/O task to core {}", other_core);
+
+            let ctrlr_clone = ctrlr.clone();
+            let sector_size_clone = sector_size;
+
+            // Dispatch to core 1 using call_on_async - returns a receiver we can poll
+            // === Core 1: I/O on LBAs 100-101, returns success bool ===
+            let core1_receiver = SpdkEvent::call_on_async(other_core, move || {
+                eprintln!("[Core {}] Starting I/O", Cores::current());
+
+                let mut pool = LocalPool::new();
+                let spawner = pool.spawner();
+
+                pool.run_until(async {
+                    // Allocate qpair on this core
+                    let qpair = Rc::new(
+                        ctrlr_clone
+                            .alloc_io_qpair(None)
+                            .expect("Failed to alloc qpair on core 1"),
+                    );
+
+                    let ns = ctrlr_clone.namespace(1).expect("No namespace 1");
+                    let mut buf = DmaBuf::alloc(sector_size_clone, sector_size_clone)
+                        .expect("Failed to alloc DMA buffer");
+
+                    // Poller for TCP completions
+                    let done = Rc::new(Cell::new(false));
+                    let done_clone = done.clone();
+                    let qpair_clone = qpair.clone();
+
+                    let poller_handle = spawner
+                        .spawn_local_with_handle(async move {
+                            while !done_clone.get() {
+                                qpair_clone.process_completions(0);
+                                futures_lite::future::yield_now().await;
+                            }
+                        })
+                        .expect("Failed to spawn poller");
+
+                    // Write pattern 0xCD to LBA 100
+                    eprintln!("[Core {}] Writing 0xCD to LBA 100", Cores::current());
+                    buf.as_mut_slice().fill(0xCD);
+                    ns.write(&qpair, &buf, 100, 1).await.expect("Write failed");
+
+                    // Read back
+                    buf.as_mut_slice().fill(0x00);
+                    ns.read(&qpair, &mut buf, 100, 1)
+                        .await
+                        .expect("Read failed");
+
+                    // Verify
+                    let success = buf.as_slice().iter().all(|&b| b == 0xCD);
+                    eprintln!(
+                        "[Core {}] Verify: {}",
+                        Cores::current(),
+                        if success { "PASS" } else { "FAIL" }
+                    );
+
+                    done.set(true);
+                    poller_handle.await;
+                    drop(qpair);
+
+                    eprintln!("[Core {}] Done", Cores::current());
+                    success
+                })
+            })
+            .expect("Failed to dispatch to core 1");
+
+            // === Core 0: I/O on LBAs 0-1 ===
+            let mut pool = LocalPool::new();
+            let spawner = pool.spawner();
+
+            let core0_success = pool.run_until(async {
+                let qpair = Rc::new(
+                    ctrlr
+                        .alloc_io_qpair(None)
+                        .expect("Failed to alloc qpair on core 0"),
+                );
+
+                let ns = ctrlr.namespace(1).expect("No namespace 1");
                 let mut buf =
                     DmaBuf::alloc(sector_size, sector_size).expect("Failed to alloc DMA buffer");
 
-                // Flag to stop the qpair poller
                 let done = Rc::new(Cell::new(false));
                 let done_clone = done.clone();
                 let qpair_clone = qpair.clone();
 
-                // Spawn background task to poll qpair for TCP completions
                 let poller_handle = spawner
                     .spawn_local_with_handle(async move {
                         while !done_clone.get() {
-                            let completions = qpair_clone.process_completions(0);
-                            // Only yield when idle (no completions processed)
-                            if completions == 0 {
-                                futures_lite::future::yield_now().await;
-                            }
+                            qpair_clone.process_completions(0);
+                            futures_lite::future::yield_now().await;
                         }
                     })
                     .expect("Failed to spawn poller");
 
-                // Write test pattern
-                eprintln!("Writing test pattern...");
+                // Write pattern 0xAB to LBA 0
+                eprintln!("[Core {}] Writing 0xAB to LBA 0", Cores::current());
                 buf.as_mut_slice().fill(0xAB);
                 ns.write(&qpair, &buf, 0, 1).await.expect("Write failed");
 
                 // Read back
-                eprintln!("Reading back...");
                 buf.as_mut_slice().fill(0x00);
                 ns.read(&qpair, &mut buf, 0, 1).await.expect("Read failed");
 
                 // Verify
-                let all_match = buf.as_slice().iter().all(|&b| b == 0xAB);
-                assert!(all_match, "Data verification failed!");
+                let success = buf.as_slice().iter().all(|&b| b == 0xAB);
+                eprintln!(
+                    "[Core {}] Verify: {}",
+                    Cores::current(),
+                    if success { "PASS" } else { "FAIL" }
+                );
 
-                // Stop the qpair poller and wait for it to complete
                 done.set(true);
                 poller_handle.await;
-
-                // Drop qpair explicitly before controller goes out of scope
                 drop(qpair);
 
-                eprintln!("=== Test Passed ===");
+                success
             });
+
+            // Wait for core 1 result using the completion receiver
+            let core1_success = pool
+                .run_until(core1_receiver)
+                .expect("Core 1 completion failed");
+
+            // Check results
+            if core0_success && core1_success {
+                eprintln!("=== Test Passed: Both cores succeeded ===");
+            } else {
+                eprintln!(
+                    "=== Test FAILED: core0={}, core1={} ===",
+                    core0_success, core1_success
+                );
+            }
+
+            assert!(core0_success, "Core 0 I/O failed");
+            assert!(core1_success, "Core 1 I/O failed");
 
             SpdkApp::stop();
         })?;

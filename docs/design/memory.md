@@ -67,9 +67,10 @@ impl Drop for NvmeQpair {
 | `BdevDesc` | ❌ | ❌ | Must close on opening thread |
 | `IoChannel` | ❌ | ❌ | Must stay on creating thread |
 | `DmaBuf` | ✅ | ❌ | Can be moved, not shared during I/O |
-| `NvmeController` | ❌ | ❌ | Operations on connecting thread |
+| `NvmeController` | ✅ | ✅ | Share via Arc; `&mut self` for completions |
 | `NvmeQpair` | ❌ | ❌ | Must stay on allocating thread |
 | `NvmeNamespace` | ❌ | ❌ | Borrowed from controller |
+| `SpdkEvent` | ✅ | ❌ | Can be sent to dispatch on lcore |
 
 ## Explicit Handle Model
 

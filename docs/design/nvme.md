@@ -37,11 +37,14 @@ impl TransportId {
 /// NVMe controller handle.
 /// 
 /// # Thread Safety
-/// `!Send + !Sync` - operations must remain on the thread that connected.
+/// `Send + Sync` - Can be shared via Arc<NvmeController>.
+/// Thread-safe ops use `&self`; non-thread-safe ops use `&mut self`.
 pub struct NvmeController {
     ptr: NonNull<spdk_nvme_ctrlr>,
-    _marker: PhantomData<*mut ()>,
 }
+
+unsafe impl Send for NvmeController {}
+unsafe impl Sync for NvmeController {}
 
 impl NvmeController {
     /// Connect to an NVMe controller.

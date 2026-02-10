@@ -26,6 +26,7 @@
 //! - [`complete`] - Callback-to-future utilities
 //! - [`dma`] - DMA-capable buffer allocation
 //! - [`env`] - Low-level environment initialization  
+//! - [`event`] - Event dispatching to specific reactor lcores
 //! - [`poller`] - SPDK poller integration for async executors
 //! - [`thread`] - SPDK thread management
 //! - [`channel`] - I/O channel management
@@ -40,6 +41,7 @@ pub mod complete;
 pub mod dma;
 pub mod env;
 pub mod error;
+pub mod event;
 pub mod nvme;
 pub mod nvmf;
 pub mod poller;
@@ -53,5 +55,6 @@ pub use complete::{CompletionReceiver, CompletionSender, block_on, completion, i
 pub use dma::DmaBuf;
 pub use env::{LogLevel, SpdkEnv, SpdkEnvBuilder};
 pub use error::{Error, Result};
+pub use event::{CoreIterator, Cores, SpdkEvent};
 pub use poller::{spdk_poller, spdk_poller_limited};
 pub use thread::{CurrentThread, JoinHandle, SpdkThread, ThreadHandle};

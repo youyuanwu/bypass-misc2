@@ -125,6 +125,11 @@ SpdkApp::builder()
 
 ## Thread API
 
+### SpdkThread
+
+An `SpdkThread` is a lightweight scheduling context (like a green thread), NOT an OS thread.
+It runs on whatever OS thread calls `poll()` on it.
+
 ```rust
 /// SPDK thread context - !Send + !Sync, must stay on creating OS thread.
 /// This is a lightweight scheduling context, NOT an OS thread.
@@ -134,14 +139,41 @@ pub struct SpdkThread {
 }
 
 impl SpdkThread {
+    // === Creation ===
+    
+    /// Attach an SPDK thread to the current OS thread (initializes thread lib if needed)
     pub fn current(name: &str) -> Result<Self>;
+    
+    /// Alias for current()
     pub fn new(name: &str) -> Result<Self>;
+    
+    /// Attach without initializing thread lib (use when already initialized by SpdkApp)
+    pub fn attach(name: &str) -> Result<Self>;
+    
+    /// Attach with custom mempool size (for testing without hugepages)
     pub fn current_with_mempool_size(name: &str, size: usize) -> Result<Self>;
+    pub fn new_with_mempool_size(name: &str, size: usize) -> Result<Self>;
+    
+    // === Thread Lookup ===
+    
+    /// Get SPDK thread attached to current OS thread
     pub fn get_current() -> Option<CurrentThread>;
+    
+    /// Get the app thread (first thread created, ID=1)
     pub fn app_thread() -> Option<CurrentThread>;
     
+    /// Get total number of SPDK threads
+    pub fn count() -> u32;
+    
+    // === Polling ===
+    
+    /// Poll to process messages and run pollers. Returns work count.
     pub fn poll(&self) -> i32;
+    
+    /// Poll with max messages limit
     pub fn poll_max(&self, max_msgs: u32) -> i32;
+    
+    // === State Queries ===
     
     pub fn has_active_pollers(&self) -> bool;
     pub fn has_pollers(&self) -> bool;
@@ -149,14 +181,52 @@ impl SpdkThread {
     pub fn is_running(&self) -> bool;
     pub fn name(&self) -> &str;
     pub fn id(&self) -> u64;
-    pub fn count() -> u32;
     
+    // === Thread Spawning ===
+    
+    /// Spawn a new OS thread with an SPDK thread attached
     pub fn spawn<F, T>(name: &str, f: F) -> JoinHandle<T>
     where
         F: FnOnce(&SpdkThread) -> T + Send + 'static,
         T: Send + 'static;
     
+    // === Cross-Thread Messaging ===
+    
+    /// Get a thread-safe handle for message passing
     pub fn handle(&self) -> ThreadHandle;
+}
+```
+
+### CurrentThread
+
+Borrowed reference to an SPDK thread (does not own it).
+
+```rust
+pub struct CurrentThread {
+    ptr: NonNull<spdk_thread>,
+    _marker: PhantomData<*mut ()>,
+}
+
+impl CurrentThread {
+    pub fn poll(&self) -> i32;
+    pub fn name(&self) -> &str;
+    pub fn id(&self) -> u64;
+    pub fn as_ptr(&self) -> *mut spdk_thread;
+}
+```
+
+### JoinHandle
+
+Handle for spawned OS thread with SPDK context.
+
+```rust
+pub struct JoinHandle<T> {
+    handle: std::thread::JoinHandle<T>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Wait for thread to complete and return result
+    pub fn join(self) -> Result<T, Box<dyn Any + Send>>;
 }
 ```
 
@@ -165,9 +235,10 @@ impl SpdkThread {
 ```rust
 /// Thread-safe handle for sending messages to an SPDK thread.
 /// Unlike SpdkThread (which is !Send), this can be sent across threads.
+/// Uses spdk_thread_send_msg() internally.
 #[derive(Clone)]
 pub struct ThreadHandle {
-    ptr: *const spdk_thread,
+    ptr: *mut spdk_thread,
 }
 
 unsafe impl Send for ThreadHandle {}
@@ -175,6 +246,7 @@ unsafe impl Sync for ThreadHandle {}
 
 impl ThreadHandle {
     /// Send a closure to execute on the target thread.
+    /// Returns immediately; closure runs on next poll().
     pub fn send<F>(&self, f: F)
     where F: FnOnce() + Send + 'static;
 
@@ -185,6 +257,202 @@ impl ThreadHandle {
         T: Send + 'static;
 
     pub fn id(&self) -> u64;
+    pub fn as_ptr(&self) -> *mut spdk_thread;
+}
+```
+
+---
+
+## SpdkEvent
+
+### Overview
+
+`SpdkEvent` enables dispatching work to a specific reactor (lcore). This is the SPDK-native
+way to do multi-core I/O - each reactor runs on a dedicated CPU core and processes events
+from its queue.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SpdkApp with reactor_mask("0x3") = cores 0 and 1               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────┐      ┌─────────────────────────────┐  │
+│  │  Reactor 0 (lcore 0)│      │  Reactor 1 (lcore 1)        │  │
+│  │  ┌───────────────┐  │      │  ┌───────────────────────┐  │  │
+│  │  │ Event Queue   │  │      │  │ Event Queue           │  │  │
+│  │  └───────────────┘  │      │  └───────────────────────┘  │  │
+│  │         ▼           │      │           ▼                 │  │
+│  │  ┌───────────────┐  │      │  ┌───────────────────────┐  │  │
+│  │  │ SPDK Thread   │  │      │  │ SPDK Thread           │  │  │
+│  │  │ + Pollers     │  │      │  │ + Pollers             │  │  │
+│  │  └───────────────┘  │      │  └───────────────────────┘  │  │
+│  │         ▼           │      │           ▼                 │  │
+│  │  NvmeController     │      │  NvmeController             │  │
+│  │  + QpairA           │      │  + QpairB                   │  │
+│  │  (LBAs 0-99)        │      │  (LBAs 100-199)             │  │
+│  └─────────────────────┘      └─────────────────────────────┘  │
+│                                                                 │
+│       SpdkEvent::call_on(1, || { ... })  ──────────────────►   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### API
+
+```rust
+/// Event for dispatching work to a specific reactor (lcore).
+///
+/// Unlike `ThreadHandle::send()` which targets a specific SPDK thread,
+/// `SpdkEvent` dispatches to an lcore's reactor.
+///
+/// Use `SpdkEvent` when you want core affinity for I/O operations.
+pub struct SpdkEvent { /* ... */ }
+
+unsafe impl Send for SpdkEvent {}
+
+impl SpdkEvent {
+    /// Allocate an event to run on a specific lcore.
+    ///
+    /// The closure will execute on the target lcore's reactor thread.
+    /// The event is NOT dispatched until `call()` is invoked.
+    ///
+    /// # Arguments
+    ///
+    /// * `lcore` - Target logical core ID (must be in reactor_mask)
+    /// * `f` - Closure to execute on the target lcore
+    ///
+    /// # Errors
+    ///
+    /// Returns error if event allocation fails (invalid lcore, out of memory).
+    pub fn new<F>(lcore: u32, f: F) -> Result<Self>
+    where
+        F: FnOnce() + Send + 'static;
+
+    /// Dispatch the event to the target lcore.
+    ///
+    /// The event is placed on the target reactor's event queue and will
+    /// be processed during the reactor's next poll cycle.
+    ///
+    /// This consumes the event (can only be called once).
+    pub fn call(mut self);
+
+    /// Allocate and dispatch in one step (convenience method).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Dispatch work to lcore 1
+    /// SpdkEvent::call_on(1, || {
+    ///     let ctrlr = NvmeController::connect(&trid, None).unwrap();
+    ///     let qpair = ctrlr.alloc_io_qpair(None).unwrap();
+    ///     // I/O on lcore 1...
+    /// })?;
+    /// ```
+    pub fn call_on<F>(lcore: u32, f: F) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static;
+
+    /// Dispatch and await completion.
+    ///
+    /// Sends the closure to the target lcore and returns a receiver that
+    /// completes when the closure finishes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Run computation on lcore 1 and get result
+    /// let result = SpdkEvent::call_on_async(1, || {
+    ///     expensive_computation()
+    /// })?.await;
+    /// ```
+    pub fn call_on_async<F, T>(lcore: u32, f: F) -> Result<CompletionReceiver<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static;
+}
+```
+
+### Core Utilities
+
+```rust
+/// CPU core utilities for reactor management.
+pub struct Cores;
+
+impl Cores {
+    /// Get current lcore ID.
+    pub fn current() -> u32;
+
+    /// Get first reactor lcore.
+    pub fn first() -> u32;
+
+    /// Get last reactor lcore.
+    pub fn last() -> u32;
+
+    /// Get total number of reactor cores.
+    pub fn count() -> u32;
+
+    /// Iterate over all reactor lcores.
+    pub fn iter() -> CoreIterator;
+}
+
+/// Iterator over reactor lcores.
+pub struct CoreIterator {
+    current: u32,
+}
+
+impl Iterator for CoreIterator {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32>;
+}
+```
+
+### Usage Example: Multi-Queue NVMe I/O
+
+```rust
+use spdk_io::{SpdkApp, SpdkEvent, Cores};
+use spdk_io::nvme::{NvmeController, TransportId};
+use std::sync::{Arc, Barrier};
+
+fn main() {
+    let nqn = "nqn.2024-01.io.spdk:test";
+    
+    SpdkApp::builder()
+        .name("multi_qpair")
+        .reactor_mask("0x3")  // Cores 0 and 1
+        .run(move || {
+            // Connect once on core 0, share via Arc (NvmeController is Sync)
+            let trid = TransportId::tcp("127.0.0.1", "4420", nqn).unwrap();
+            let ctrlr = Arc::new(NvmeController::connect(&trid, None).unwrap());
+            
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_clone = barrier.clone();
+            let ctrlr_clone = ctrlr.clone();
+
+            // === Dispatch I/O to lcore 1 ===
+            SpdkEvent::call_on(1, move || {
+                // Allocate qpair on core 1 - uses &self, thread-safe
+                let qpair1 = ctrlr_clone.alloc_io_qpair(None).unwrap();
+                // qpair1 stays on core 1, cannot be moved
+
+                let ns = ctrlr_clone.namespace(1).unwrap();
+
+                // Write to LBAs 100-199 on lcore 1
+                // ... async I/O with poller ...
+
+                barrier_clone.wait();
+            }).unwrap();
+
+            // === I/O on lcore 0 (current) ===
+            let qpair0 = ctrlr.alloc_io_qpair(None).unwrap();
+            let ns = ctrlr.namespace(1).unwrap();
+
+            // Write to LBAs 0-99 on lcore 0
+            // ... async I/O with poller ...
+
+            barrier.wait();
+            SpdkApp::stop();
+        })
+        .unwrap();
 }
 ```
 

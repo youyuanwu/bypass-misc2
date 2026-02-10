@@ -12,6 +12,16 @@
     - Modules: `bdev`, `bdev_module`, `io_channel`, `thread`, `poller`, `dma`, `nvme`, `nvmf`
     - Helper utilities in `ffihelper.rs`: `cb_arg()`, `done_cb()`, `ErrnoResult`, string conversions
     - Async support via `futures::channel::oneshot` for callback-to-async conversion
+  - **Multi-threading**:
+    - `Thread::new(name, core)` - Create SPDK thread pinned to specific CPU core via `CpuMask`
+    - `Thread::send_msg(args, f)` - Cross-thread messaging via `spdk_thread_send_msg()`
+    - `Thread::with(f)` - Execute closure with thread as current context
+    - `CurrentThreadGuard` - RAII guard for saving/restoring current SPDK thread
+    - `PollerBuilder::with_core(core)` - Run poller on different core (creates thread, sends msg to register)
+    - `Cores` / `CoreIterator` - Iterate over available CPU cores
+    - `CpuMask` - CPU affinity mask wrapper
+    - `RoundRobinCoreSelector` - Load balancing across cores
+    - `IoDeviceChannelTraverse` - Async iteration over all I/O channels via `spdk_for_each_channel`
 
 - [starfish](https://github.com/jkozlowski/starfish) Rust futures on spdk
   - **Summary**: Async programming framework with SPDK for Rust (Linux only). Provides a futures executor (`starfish-executor`) that integrates with SPDK's event loop. Includes `spdk-sys` for low-level bindings. Last updated 7 years ago (2018), built for SPDK v18.07.1. 33 stars.
@@ -23,6 +33,7 @@
     - Async functions using `oneshot::channel` callback pattern: `bs_init()`, `create()`, `open()`, `read()`, `write()`, `close()`
     - Event loop integration via `poller_register()` and `pure_poll()` entry point
     - `AppOpts` for SPDK application initialization
+  - **Multi-threading**: Single-threaded executor design, no multi-core support
 
 - [async-spdk](https://github.com/madsys-dev/async-spdk)
   - **Summary**: Asynchronous Rust bindings for SPDK from MadSys research group. Provides Blob and BlobFs APIs with async/await support. Includes hello_blob and hello_bdev examples. Requires root privileges. Last updated 4 years ago. 17 stars, 2 contributors.
@@ -36,6 +47,17 @@
     - BlobFs API: `SpdkFilesystem`, `SpdkFile`, `SpdkFsThreadCtx`, `SpdkBlobfsOpts`
     - Bdev API: `BDev`, `BdevDesc`, `BdevIo`, `DmaBuf`
     - Thread/Poller management: `Thread`, `Poller`, `CpuSet`
+  - **Multi-threading**:
+    - `AppOpts::reactor_mask(mask)` - Set CPU cores for SPDK reactors (e.g., `"0x3"` for cores 0+1)
+    - `AppOpts::main_core(core)` - Set main reactor core
+    - `Thread::create(name, cpumask)` - Create SPDK thread with CPU affinity
+    - `Thread::set()` - Force current OS thread to act as SPDK thread
+    - `Thread::poll(max_msgs)` - Poll thread for messages and pollers
+    - `SpdkEvent::alloc(lcore, arg1, arg2)` - Allocate event for specific lcore via `spdk_event_allocate`
+    - `SpdkEvent::call()` - Dispatch event to target reactor's event ring
+    - `CpuSet` - CPU mask for thread affinity
+    - `Poller::register(f)` / `pause()` / `resume()` - Poller management
+    - Uses `std::thread::spawn` for separate OS thread in blobfs example
 
 - [rust-spdk](https://github.com/PumpkinDB/rust-spdk)
   - **Summary**: Early/basic Rust bindings for SPDK from the PumpkinDB project. Focused on NVMe controller access from Rust. Last updated 9 years ago (2017), likely abandoned. 19 stars. Minimal wrapper approach.
@@ -48,3 +70,4 @@
     - `DMA<'a>` struct for DMA buffer management with lifetime
     - `EnvOpts` + `init_env()` for environment initialization
     - Macros: `ns_data!`, `ctrlr_data!` for accessing struct fields
+  - **Multi-threading**: No threading abstractions, minimal env init only

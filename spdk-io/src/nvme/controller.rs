@@ -3,7 +3,6 @@
 //! Controller management and connection.
 
 use std::ffi::c_void;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
@@ -23,7 +22,32 @@ use super::transport::TransportId;
 ///
 /// # Thread Safety
 ///
-/// `!Send + !Sync` - controller operations must remain on the thread that connected.
+/// `Send + Sync` - The controller can be shared across threads via `Arc<NvmeController>`.
+/// Thread-safe operations use `&self` and are protected by SPDK's internal mutex:
+/// - [`alloc_io_qpair()`](Self::alloc_io_qpair)
+/// - [`namespace()`](Self::namespace)
+/// - [`num_namespaces()`](Self::num_namespaces)
+///
+/// Non-thread-safe operations require `&mut self`, enforcing single-threaded access:
+/// - [`process_admin_completions()`](Self::process_admin_completions)
+///
+/// Each [`NvmeQpair`] remains `!Send` and must stay on the thread that allocated it.
+///
+/// # Multi-Core I/O Pattern
+///
+/// ```ignore
+/// use std::sync::Arc;
+///
+/// // Core 0: Connect and share via Arc
+/// let ctrlr = Arc::new(NvmeController::connect(&trid, None)?);
+/// let qpair0 = ctrlr.alloc_io_qpair(None)?;  // &self, thread-safe
+///
+/// let ctrlr_clone = ctrlr.clone();
+/// SpdkEvent::call_on(1, move || {
+///     let qpair1 = ctrlr_clone.alloc_io_qpair(None).unwrap();  // &self, thread-safe
+///     // qpair1 stays on core 1
+/// })?;
+/// ```
 ///
 /// # Example
 ///
@@ -45,8 +69,14 @@ use super::transport::TransportId;
 /// ```
 pub struct NvmeController {
     ptr: NonNull<spdk_nvme_ctrlr>,
-    _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
+
+// SAFETY: spdk_nvme_ctrlr has internal mutex (ctrlr_lock) protecting most operations.
+// Thread-safe operations (alloc_io_qpair, namespace, etc.) use &self.
+// Non-thread-safe operations (process_admin_completions) require &mut self,
+// which Rust's borrow checker enforces as single-threaded access.
+unsafe impl Send for NvmeController {}
+unsafe impl Sync for NvmeController {}
 
 impl NvmeController {
     /// Connect to an NVMe controller.
@@ -109,10 +139,7 @@ impl NvmeController {
         let ctrlr = unsafe { spdk_nvme_connect(trid.as_ptr(), opts_ptr, 0) };
 
         NonNull::new(ctrlr)
-            .map(|ptr| Self {
-                ptr,
-                _marker: PhantomData,
-            })
+            .map(|ptr| Self { ptr })
             .ok_or(Error::ControllerNotFound)
     }
 
@@ -204,10 +231,7 @@ impl NvmeController {
         ATTACHED_CTRLR
             .with(|cell| cell.borrow_mut().take())
             .and_then(NonNull::new)
-            .map(|ptr| Self {
-                ptr,
-                _marker: PhantomData,
-            })
+            .map(|ptr| Self { ptr })
             .ok_or(Error::ControllerNotFound)
     }
 
@@ -221,7 +245,6 @@ impl NvmeController {
     pub unsafe fn from_raw(ptr: *mut spdk_nvme_ctrlr) -> Self {
         Self {
             ptr: unsafe { NonNull::new_unchecked(ptr) },
-            _marker: PhantomData,
         }
     }
 
@@ -307,7 +330,12 @@ impl NvmeController {
     /// Process admin command completions.
     ///
     /// Call periodically to process admin command responses and keep-alive.
-    pub fn process_admin_completions(&self) -> i32 {
+    ///
+    /// # Thread Safety
+    ///
+    /// Requires `&mut self` because this operation is NOT thread-safe.
+    /// Only one thread may call this at a time.
+    pub fn process_admin_completions(&mut self) -> i32 {
         unsafe { spdk_nvme_ctrlr_process_admin_completions(self.ptr.as_ptr()) }
     }
 
