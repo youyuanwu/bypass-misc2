@@ -9,6 +9,7 @@ license.workspace = true
 description = "Low-level FFI bindings for SPDK"
 build = "build.rs"
 links = "spdk"
+include = ["/src", "/build.rs", "/wrapper.h"]
 
 [dependencies]
 
