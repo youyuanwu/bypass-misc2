@@ -30,12 +30,8 @@ add_custom_target(spdk_deb
     COMMAND ${CMAKE_COMMAND} -E env DESTDIR=${SPDK_PKG_DIR} $(MAKE) -C ${spdk_SOURCE_DIR}/shared_lib install
     COMMAND ${CMAKE_COMMAND} -E env DESTDIR=${SPDK_PKG_DIR} $(MAKE) -C ${spdk_SOURCE_DIR}/include install
     COMMAND ${CMAKE_COMMAND} -E env DESTDIR=${SPDK_PKG_DIR} $(MAKE) -C ${spdk_SOURCE_DIR}/app install
-    # Install DPDK to staging directory
-    COMMAND ${CMAKE_COMMAND} -E env DESTDIR=${SPDK_PKG_DIR} ninja -C ${spdk_SOURCE_DIR}/dpdk/build-tmp install
-    # Move DPDK files from build prefix to /opt/spdk (use cp -a to preserve symlinks)
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SPDK_PKG_DIR}/opt/spdk
-    COMMAND cp -a ${SPDK_PKG_DIR}${spdk_SOURCE_DIR}/dpdk/build/. ${SPDK_PKG_DIR}/opt/spdk/
-    COMMAND ${CMAKE_COMMAND} -E remove_directory ${SPDK_PKG_DIR}/home
+    # Install DPDK to staging directory (uses dpdkbuild which reconfigures prefix to /opt/spdk)
+    COMMAND ${CMAKE_COMMAND} -E env DESTDIR=${SPDK_PKG_DIR} $(MAKE) -C ${spdk_SOURCE_DIR}/dpdkbuild install
     # Install bundled ISA-L libraries if built (uses autotools install which includes .pc files)
     COMMAND test -f ${spdk_SOURCE_DIR}/isa-l/Makefile && $(MAKE) -C ${spdk_SOURCE_DIR}/isa-l DESTDIR=${SPDK_PKG_DIR} install
     COMMAND test -f ${spdk_SOURCE_DIR}/isa-l-crypto/Makefile && $(MAKE) -C ${spdk_SOURCE_DIR}/isa-l-crypto DESTDIR=${SPDK_PKG_DIR} install
